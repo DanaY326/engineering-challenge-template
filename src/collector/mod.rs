@@ -46,6 +46,12 @@ pub struct Config {
     pub heartbeat_interval: Duration,
     /// Reconnect a socket that has received nothing (not even a pong) for this long.
     pub read_timeout: Duration,
+    /// At each minute snapshot, move symbols to the replica that most often
+    /// receives updates first.
+    pub prefer_fastest: bool,
+    /// Recycle a socket early after this many consecutive minutes of rarely
+    /// being first to receive updates (0 disables).
+    pub recycle_slow_after: u32,
     /// Total websockets we may open. Defaults to 95% of the exchange's limit
     /// (headroom for reconnects); once reached, new symbols are added to the
     /// least-loaded shards instead of opening new ones.
@@ -68,6 +74,8 @@ impl Default for Config {
             max_quiet_backoff: Duration::from_secs(4 * 60 * 60),
             heartbeat_interval: Duration::from_secs(10),
             read_timeout: Duration::from_secs(30),
+            prefer_fastest: true,
+            recycle_slow_after: 3,
             max_connections: None,
         }
     }

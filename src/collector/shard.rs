@@ -13,7 +13,8 @@
 //! - whole sockets are recycled periodically, one at a time, while the other
 //!   replicas are healthy.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -150,10 +151,117 @@ struct Replica {
     tx: UnboundedSender<ConnCommand>,
     connected_since: Option<Instant>,
     recycle_after: Duration,
+    /// Consecutive minutes this replica was rarely first to receive updates.
+    slow_minutes: u32,
 }
+
+/// A replica is "slow" in a minute when it is first for less than this
+/// fraction of its fair share (1 / replicas) of updates.
+const SLOW_SHARE: f64 = 0.25;
 
 /// Most monitoring-triggered resubscribes per socket per health check (1 s).
 const MAX_RESUBSCRIBES_PER_TICK: usize = 20;
+
+/// Which replica sees each exchange update first (Extension 4).
+#[derive(Default)]
+struct LatencyTracker {
+    seen: HashMap<u64, (Instant, u32)>,
+    order: VecDeque<(Instant, u64)>,
+    first: Vec<u64>,
+    lag_sum: Vec<Duration>,
+    lag_n: Vec<u64>,
+    lag_max: Vec<Duration>,
+    /// Sum of (received_at - exchange_ts) in microseconds, and count.
+    transit_us: Vec<(i64, u64)>,
+}
+
+const LATENCY_MATCH_WINDOW: Duration = Duration::from_secs(5);
+
+impl LatencyTracker {
+    fn new(replicas: usize) -> Self {
+        Self {
+            first: vec![0; replicas],
+            lag_sum: vec![Duration::ZERO; replicas],
+            lag_n: vec![0; replicas],
+            lag_max: vec![Duration::ZERO; replicas],
+            transit_us: vec![(0, 0); replicas],
+            ..Default::default()
+        }
+    }
+
+    fn observe(&mut self, key: u64, replica: usize, at: Instant) {
+        let bit = 1u32 << replica;
+        match self.seen.get_mut(&key) {
+            None => {
+                self.seen.insert(key, (at, bit));
+                self.order.push_back((at, key));
+                self.first[replica] += 1;
+            }
+            Some((first_at, mask)) if *mask & bit == 0 => {
+                *mask |= bit;
+                let lag = at.saturating_duration_since(*first_at);
+                self.lag_sum[replica] += lag;
+                self.lag_n[replica] += 1;
+                self.lag_max[replica] = self.lag_max[replica].max(lag);
+            }
+            Some(_) => {}
+        }
+        while let Some(&(t, k)) = self.order.front() {
+            if at.saturating_duration_since(t) < LATENCY_MATCH_WINDOW {
+                break;
+            }
+            self.order.pop_front();
+            self.seen.remove(&k);
+        }
+    }
+
+    fn observe_transit(&mut self, replica: usize, received_at: DateTime<Utc>, exchange_ts: DateTime<Utc>) {
+        let us = (received_at - exchange_ts).num_microseconds().unwrap_or(0);
+        let entry = &mut self.transit_us[replica];
+        entry.0 += us;
+        entry.1 += 1;
+    }
+
+    /// Each replica's share of updates it received first, if there is
+    /// enough data.
+    fn first_shares(&self) -> Option<Vec<f64>> {
+        let total: u64 = self.first.iter().sum();
+        (total >= 50).then(|| self.first.iter().map(|&f| f as f64 / total as f64).collect())
+    }
+
+    /// The replica that was first most often, if there is enough data.
+    fn fastest(&self) -> Option<usize> {
+        let total: u64 = self.first.iter().sum();
+        if total < 50 {
+            return None;
+        }
+        (0..self.first.len()).max_by_key(|&r| self.first[r])
+    }
+
+    fn report(&self) -> String {
+        let total: u64 = self.first.iter().sum::<u64>().max(1);
+        let mut s = String::new();
+        for r in 0..self.first.len() {
+            let mean_lag = self.lag_sum[r]
+                .checked_div(self.lag_n[r].max(1) as u32)
+                .unwrap_or_default();
+            let (transit_sum, transit_n) = self.transit_us[r];
+            let _ = write!(
+                s,
+                " r{r}: first {:.0}% lag(mean {:.2}ms max {:.2}ms) transit {:.1}ms;",
+                100.0 * self.first[r] as f64 / total as f64,
+                mean_lag.as_secs_f64() * 1e3,
+                self.lag_max[r].as_secs_f64() * 1e3,
+                transit_sum as f64 / transit_n.max(1) as f64 / 1e3,
+            );
+        }
+        s
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.first.len());
+    }
+}
 
 #[derive(Default)]
 struct Counters {
@@ -170,6 +278,7 @@ pub struct Shard {
     out: UnboundedSender<OutMsg>,
     replicas: Vec<Replica>,
     symbols: HashMap<String, SymbolState>,
+    latency: LatencyTracker,
     counters: Counters,
     last_recycle: Instant,
     /// Everything received up to this time has been applied: the latest
@@ -243,6 +352,7 @@ impl Shard {
         let now = Instant::now();
         Shard {
             id,
+            latency: LatencyTracker::new(replica_txs.len()),
             symbols: symbols
                 .into_iter()
                 .map(|s| (s, SymbolState::new(&cfg, now)))
@@ -253,6 +363,7 @@ impl Shard {
                     tx,
                     connected_since: None,
                     recycle_after: jittered(cfg.recycle_interval),
+                    slow_minutes: 0,
                 })
                 .collect(),
             cfg,
@@ -421,6 +532,7 @@ impl Shard {
         match msg.kind {
             ReplicaMsgKind::Connected => {
                 self.replicas[r].connected_since = Some(now);
+                self.replicas[r].slow_minutes = 0;
                 for state in self.symbols.values_mut() {
                     let rs = &mut state.replicas[r];
                     rs.requested_at = now;
@@ -528,6 +640,12 @@ impl Shard {
                 let rs = &mut state.replicas[r];
                 rs.last_event = Some(mono);
                 rs.last_level = Some(mono);
+                if let Some(key) = match_key {
+                    self.latency.observe(key, r, mono);
+                }
+                if let Some(ts) = exchange_ts {
+                    self.latency.observe_transit(r, received_at, ts);
+                }
                 let Some(rb) = rs.book.as_mut() else {
                     return;
                 };
@@ -678,15 +796,23 @@ impl Shard {
             let Some(since) = self.replicas[r].connected_since else {
                 continue;
             };
-            if now - since < self.replicas[r].recycle_after {
+            let slow = self.cfg.recycle_slow_after > 0
+                && self.replicas[r].slow_minutes >= self.cfg.recycle_slow_after;
+            if now - since < self.replicas[r].recycle_after && !slow {
                 continue;
             }
             let others_healthy = (0..self.replicas.len())
                 .filter(|&o| o != r)
                 .all(|o| connected[o] && synced[o] * 10 >= total * 9);
             if others_healthy {
-                tracing::info!(shard = self.id, replica = r, "recycling socket");
+                let reason = if slow {
+                    "rarely first to receive updates; drawing a new connection"
+                } else {
+                    "periodic"
+                };
+                tracing::info!(shard = self.id, replica = r, "recycling socket: {reason}");
                 self.replicas[r].recycle_after = jittered(self.cfg.recycle_interval);
+                self.replicas[r].slow_minutes = 0;
                 let _ = self.replicas[r].tx.send(ConnCommand::Reconnect);
                 self.last_recycle = now;
                 return;
@@ -695,6 +821,18 @@ impl Shard {
     }
 
     fn minute_tick(&mut self) {
+        // Moving symbols to the replica that is usually first is free right
+        // before the minute snapshot, which re-baselines every book anyway.
+        if self.cfg.prefer_fastest
+            && let Some(fastest) = self.latency.fastest()
+        {
+            for state in self.symbols.values_mut() {
+                if state.primary.is_some() && state.replicas[fastest].book.is_some() {
+                    state.primary = Some(fastest);
+                }
+            }
+        }
+
         let received_at = self.as_of;
         let mut no_source = 0;
         let symbols: Vec<(String, Option<usize>)> = self
@@ -719,7 +857,7 @@ impl Shard {
             .collect();
         let c = &self.counters;
         tracing::info!(
-            "shard {}: {} symbols, synced per replica {:?}, no source {}, updates {}, snapshots {}, switches {}, resubscribes {}, missed-data recoveries {}",
+            "shard {}: {} symbols, synced per replica {:?}, no source {}, updates {}, snapshots {}, switches {}, resubscribes {}, missed-data recoveries {} |{}",
             self.id,
             self.symbols.len(),
             synced,
@@ -729,8 +867,20 @@ impl Shard {
             c.switches,
             c.resubscribes,
             c.recovered,
+            self.latency.report(),
         );
+        if let Some(shares) = self.latency.first_shares() {
+            let fair = 1.0 / self.replicas.len() as f64;
+            for (replica, share) in self.replicas.iter_mut().zip(shares) {
+                if share < fair * SLOW_SHARE {
+                    replica.slow_minutes += 1;
+                } else {
+                    replica.slow_minutes = 0;
+                }
+            }
+        }
         self.counters = Counters::default();
+        self.latency.reset();
     }
 }
 
@@ -1064,6 +1214,26 @@ mod tests {
         assert!(h.commands(1).is_empty());
         let rs = &h.shard.symbols[SYM].replicas[1];
         assert!(rs.retry_backoff > h.shard.cfg.sync_timeout);
+    }
+
+    #[test]
+    fn persistently_slow_replica_is_recycled_early() {
+        let mut h = Harness::new(2);
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        h.snapshot(1, &[(400_000, 10)], &[]);
+        h.shard.last_recycle = Instant::now() - Duration::from_secs(120);
+        for minute in 0..3 {
+            // Replica 0 never sees an update first.
+            h.shard.latency.first = vec![0, 100];
+            h.shard.minute_tick();
+            h.shard.health_check();
+            let recycled = h
+                .commands(0)
+                .iter()
+                .any(|c| matches!(c, ConnCommand::Reconnect));
+            assert_eq!(recycled, minute == 2, "minute {minute}");
+        }
+        assert!(h.commands(1).is_empty());
     }
 
     #[test]

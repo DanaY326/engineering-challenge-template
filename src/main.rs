@@ -51,6 +51,10 @@ struct Cli {
     #[arg(long)]
     max_connections: Option<usize>,
 
+    /// Don't move symbols to the replica that most often receives updates first.
+    #[arg(long)]
+    no_prefer_fastest: bool,
+
     #[arg(long, env = "KALSHI_API_KEY_ID")]
     kalshi_key_id: Option<String>,
 
@@ -92,6 +96,7 @@ fn main() -> anyhow::Result<()> {
         max_symbols: cli.max_symbols,
         discovery_interval: Duration::from_secs(cli.discovery_interval_secs),
         recycle_interval: Duration::from_secs(cli.recycle_interval_secs),
+        prefer_fastest: !cli.no_prefer_fastest,
         max_connections: cli.max_connections,
         ..Config::default()
     };

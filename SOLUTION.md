@@ -65,7 +65,7 @@ discovery loop ──(add/remove symbols)──► shard 0..N ──► writer t
 |---|---|
 | `collector/exchange/` | The only exchange-specific code. `kalshi.rs`: auth, market discovery, subscribe/resubscribe, decoding into `Snapshot` / `Level` / `Desync`, sequence checks. `polymarket.rs` does the same for Polymarket (Extension 3). |
 | `collector/connection.rs` | One websocket. It handles connect and reconnect with backoff, sends pings, and reconnects after 30 s of silence. It timestamps each frame as soon as it is read. |
-| `collector/shard.rs` | Runs ≤ `symbols_per_shard` symbols on `replicas` sockets, keeping one book per (symbol, replica). It writes updates and minute snapshots, and handles failover, monitoring and recycling. |
+| `collector/shard.rs` | Runs ≤ `symbols_per_shard` symbols on `replicas` sockets, keeping one book per (symbol, replica). It writes updates and minute snapshots, and handles failover, monitoring, recycling and latency stats. |
 | `collector/mod.rs` | The discovery loop. New symbols start collecting page by page as the listing streams in. Removals are applied only once the listing is complete, so a partial listing never unsubscribes live markets. |
 | `collector/output.rs` | The writer thread, so file I/O never stalls the network tasks. An output error, such as a full disk, shuts the collector down instead of silently dropping data. |
 | `bin/inspect.rs` | Reads an output file with the template's reader and checks it: no update before its symbol's first snapshot, no per-symbol timestamp going backwards, no crossed snapshot. |
@@ -145,13 +145,14 @@ Every second, the shard checks each (symbol, replica):
   per second; the rest wait for the next tick. A burst, such as everything
   after a reconnect, can't flood the exchange with commands.
 - **Periodic socket recycling.** Each socket reconnects about every 30 min
-  (±25% jitter). A socket recycles only when every other replica in the
+  (±25% jitter). A socket that is consistently slow is recycled sooner (see
+  Extension 4). A socket recycles only when every other replica in the
   shard is connected and ≥90% synced, and at most one per shard per minute.
   So recycling never leaves a symbol without a source.
 
 Each shard logs one summary line per minute: synced counts per replica,
-symbols with no source, updates, snapshots, switches, resubscribes, and
-recoveries.
+symbols with no source, updates, snapshots, switches, resubscribes,
+recoveries, and latency stats.
 
 ## Running at full scale (Kalshi, 2026-10-30)
 
@@ -201,9 +202,19 @@ Adding an exchange means implementing both (see `polymarket.rs`, about 300
 lines including tests). The `Level` event carries either a `Delta` (Kalshi)
 or an `Absolute` size (Polymarket), and the shared `Book` handles both.
 
+## Extension 4: latency
+
+Every frame is stamped as soon as it is read, and each shard records which
+replica receives each update first (matched by the same keys as Extension 1).
+With `prefer_fastest` (default on), each symbol moves to the most-often-first
+replica at the minute boundary, where the minute snapshot re-baselines the
+book anyway. A replica that is rarely first for 3 minutes in a row is
+recycled early to draw a new connection. Experiments and findings are in
+[LATENCY.md](LATENCY.md).
+
 ## Verification
 
-- `cargo test --release` runs 23 unit tests:
+- `cargo test --release` runs 24 unit tests:
   - fixed-point parsing; book apply and diff;
   - Kalshi decode, seq-gap recovery, the snapshot-clock filter, the
     resubscribe handshake and Ed25519 signing; Polymarket decode;
@@ -214,7 +225,7 @@ or an `Absolute` size (Polymarket), and the shared `Book` handles both.
     a replica that misses an update is resubscribed, but one that merely
     receives it second is not; unsynced replicas are retried with backoff;
     resubscribes are rate-limited; timestamps stay monotonic; minute
-    snapshots.
+    snapshots; early recycling of a slow socket.
 - Live Kalshi runs (Ed25519 key), read back with `inspect`: 300 markets on
   2 shards × 2 sockets were all clean, with 389 two-sided books and none
   crossed (confirming the NO→ask inversion) and no delta driving a level
