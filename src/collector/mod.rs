@@ -1,6 +1,6 @@
-//! A Kalshi orderbook collector.
+//! An exchange-agnostic orderbook collector.
 //!
-//! [`run`] periodically lists Kalshi's live markets and spreads them
+//! [`run`] periodically lists the exchange's live symbols and spreads them
 //! across shards (see [`shard`]), each served by several redundant websockets
 //! (see [`connection`]). Shards write snapshots and level updates to the
 //! output channel consumed by [`output::spawn_writer`].
@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use exchange::kalshi::Kalshi;
+use exchange::Exchange;
 use output::OutMsg;
 use shard::ShardCommand;
 
@@ -79,8 +79,8 @@ struct ShardHandle {
     symbols: HashSet<String>,
 }
 
-struct Collector {
-    exchange: Arc<Kalshi>,
+struct Collector<E: Exchange> {
+    exchange: Arc<E>,
     cfg: Arc<Config>,
     out: UnboundedSender<OutMsg>,
     cancel: CancellationToken,
@@ -91,8 +91,8 @@ struct Collector {
 }
 
 /// Run until `cancel` fires, then wait for every shard (and socket) to close.
-pub async fn run(
-    exchange: Arc<Kalshi>,
+pub async fn run<E: Exchange>(
+    exchange: Arc<E>,
     cfg: Config,
     out: UnboundedSender<OutMsg>,
     cancel: CancellationToken,
@@ -165,7 +165,7 @@ pub async fn run(
     }
 }
 
-impl Collector {
+impl<E: Exchange> Collector<E> {
     /// Apply a complete listing: remove unlisted symbols and add new ones.
     /// Returns `(added, removed)`.
     fn reconcile(&mut self, listed: Vec<String>) -> (usize, usize) {

@@ -14,8 +14,7 @@ use crate::util::dtos::challenge_orderbook::{
 pub enum LevelChange {
     /// Add this (possibly negative) amount to the level (Kalshi).
     Delta(i64),
-    /// The level's new absolute size; zero removes it (e.g. replaying our
-    /// own output, whose updates carry absolute quantities).
+    /// The level's new absolute size; zero removes it (Polymarket).
     Absolute(i64),
 }
 
@@ -99,6 +98,28 @@ impl Book {
         Ok(quantity)
     }
 
+    /// The level updates that turn `self` into `newer`, as
+    /// `(side, price, new absolute quantity)`.
+    pub fn diff(&self, newer: &Book) -> Vec<(Side, i64, i64)> {
+        let mut out = Vec::new();
+        for (side, old, new) in [
+            (Side::Buy, &self.bids, &newer.bids),
+            (Side::Sell, &self.asks, &newer.asks),
+        ] {
+            for &price in old.keys() {
+                if !new.contains_key(&price) {
+                    out.push((side, price, 0));
+                }
+            }
+            for (&price, &qty) in new {
+                if old.get(&price) != Some(&qty) {
+                    out.push((side, price, qty));
+                }
+            }
+        }
+        out
+    }
+
     pub fn best_bid(&self) -> Option<i64> {
         self.bids.keys().next_back().copied()
     }
@@ -158,6 +179,20 @@ mod tests {
                 .is_err()
         );
         assert!(!book.asks.contains_key(&700_000));
+    }
+
+    #[test]
+    fn diff_round_trips() {
+        let old = Book::from_levels(&[(1, 1), (2, 2)], &[(5, 5)]);
+        let new = Book::from_levels(&[(2, 3), (3, 1)], &[(5, 5), (6, 1)]);
+        let mut patched = old.clone();
+        for (side, price, qty) in old.diff(&new) {
+            patched
+                .apply(side, price, LevelChange::Absolute(qty))
+                .unwrap();
+        }
+        assert_eq!(patched, new);
+        assert!(new.diff(&new).is_empty());
     }
 
     #[test]

@@ -3,15 +3,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use engineering_challenge::collector::exchange::kalshi::{Credentials, Kalshi};
+use engineering_challenge::collector::exchange::polymarket::Polymarket;
 use engineering_challenge::collector::{self, Config, output};
 use tokio_util::sync::CancellationToken;
 
-/// Collect orderbooks for every live Kalshi market, writing SBE snapshots
-/// (every minute and on source changes) and price level updates.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExchangeName {
+    Kalshi,
+    Polymarket,
+}
+
+/// Collect orderbooks for every live symbol on an exchange, writing SBE
+/// snapshots (every minute and on source changes) and price level updates.
 #[derive(Parser, Debug)]
 struct Cli {
+    #[arg(long, value_enum, default_value = "kalshi")]
+    exchange: ExchangeName,
+
     /// Output file; "-" writes to stdout. Logs always go to stderr.
     #[arg(long, short, default_value = "-")]
     output: String,
@@ -20,10 +30,10 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     replicas: usize,
 
-    /// Markets per shard (each shard has `--replicas` sockets). Kalshi has
-    /// ~170k mostly-illiquid markets.
-    #[arg(long, default_value_t = 1000)]
-    symbols_per_shard: usize,
+    /// Symbols per shard (each shard has `--replicas` sockets). Defaults to
+    /// 1000 for Kalshi (~158k mostly-illiquid markets) and 250 for Polymarket.
+    #[arg(long)]
+    symbols_per_shard: Option<usize>,
 
     /// Only collect this many symbols (useful for testing).
     #[arg(long)]
@@ -75,7 +85,10 @@ fn main() -> anyhow::Result<()> {
 
     let cfg = Config {
         replicas: cli.replicas,
-        symbols_per_shard: cli.symbols_per_shard,
+        symbols_per_shard: cli.symbols_per_shard.unwrap_or(match cli.exchange {
+            ExchangeName::Kalshi => 1000,
+            ExchangeName::Polymarket => 250,
+        }),
         max_symbols: cli.max_symbols,
         discovery_interval: Duration::from_secs(cli.discovery_interval_secs),
         recycle_interval: Duration::from_secs(cli.recycle_interval_secs),
@@ -110,23 +123,30 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-        let credentials = match (&cli.kalshi_key_id, &cli.kalshi_private_key) {
-            (Some(id), Some(path)) => {
-                let path = expand_home(path);
-                let pem = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                Some(Credentials::new(id.clone(), &pem)?)
+        match cli.exchange {
+            ExchangeName::Kalshi => {
+                let credentials = match (&cli.kalshi_key_id, &cli.kalshi_private_key) {
+                    (Some(id), Some(path)) => {
+                        let path = expand_home(path);
+                        let pem = std::fs::read_to_string(&path)
+                            .with_context(|| format!("reading {}", path.display()))?;
+                        Some(Credentials::new(id.clone(), &pem)?)
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "no Kalshi credentials (KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH); \
+                             the websocket will likely reject the connection"
+                        );
+                        None
+                    }
+                };
+                let exchange = Arc::new(Kalshi::new(cli.kalshi_demo, credentials));
+                collector::run(exchange, cfg, out_tx, cancel).await;
             }
-            _ => {
-                tracing::warn!(
-                    "no Kalshi credentials (KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH); \
-                     the websocket will likely reject the connection"
-                );
-                None
+            ExchangeName::Polymarket => {
+                collector::run(Arc::new(Polymarket::default()), cfg, out_tx, cancel).await;
             }
-        };
-        let exchange = Arc::new(Kalshi::new(cli.kalshi_demo, credentials));
-        collector::run(exchange, cfg, out_tx, cancel).await;
+        }
         anyhow::Ok(())
     })?;
     // Don't wait on lingering tasks (e.g. an in-flight REST request).

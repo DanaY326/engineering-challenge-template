@@ -1,6 +1,6 @@
 //! One websocket connection (a "replica") serving a shard's symbols.
 //!
-//! The task owns the socket and the Kalshi session. It reconnects with
+//! The task owns the socket and the exchange [`Session`]. It reconnects with
 //! backoff, sends heartbeats, tears the socket down if it goes silent, and
 //! forwards every decoded event to the shard, stamped with the time the frame
 //! was read off the socket.
@@ -16,8 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use super::Config;
-use super::exchange::FeedEvent;
-use super::exchange::kalshi::Kalshi;
+use super::exchange::{Exchange, FeedEvent, Session};
 
 pub enum ConnCommand {
     Subscribe(Vec<String>),
@@ -52,8 +51,8 @@ enum Exit {
     Reconnect(String),
 }
 
-pub struct Connection {
-    pub exchange: Arc<Kalshi>,
+pub struct Connection<E: Exchange> {
+    pub exchange: Arc<E>,
     pub cfg: Arc<Config>,
     pub shard: usize,
     pub replica: usize,
@@ -63,7 +62,7 @@ pub struct Connection {
     pub cancel: CancellationToken,
 }
 
-impl Connection {
+impl<E: Exchange> Connection<E> {
     fn send(&self, kind: ReplicaMsgKind) {
         // The shard only goes away on shutdown, at which point we stop too.
         let _ = self.events.send(ReplicaMsg {
@@ -204,6 +203,9 @@ impl Connection {
                     }
                     if sink.send(Message::Ping(Vec::new())).await.is_err() {
                         break Exit::Reconnect("ping failed".to_owned());
+                    }
+                    if let Some(text) = self.exchange.app_heartbeat() {
+                        out.push(text.to_owned());
                     }
                 }
             }

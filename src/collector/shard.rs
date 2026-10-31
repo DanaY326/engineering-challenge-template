@@ -26,8 +26,7 @@ use tokio_util::sync::CancellationToken;
 use super::Config;
 use super::book::Book;
 use super::connection::{ConnCommand, Connection, ReplicaMsg, ReplicaMsgKind};
-use super::exchange::FeedEvent;
-use super::exchange::kalshi::Kalshi;
+use super::exchange::{Exchange, FeedEvent};
 use super::output::OutMsg;
 use crate::Side;
 use crate::util::dtos::challenge_orderbook::PriceLevelUpdateDomain;
@@ -182,9 +181,9 @@ pub struct Shard {
 }
 
 /// Spawn a shard and its replica connections.
-pub fn spawn(
+pub fn spawn<E: Exchange>(
     id: usize,
-    exchange: Arc<Kalshi>,
+    exchange: Arc<E>,
     symbols: Vec<String>,
     cfg: Arc<Config>,
     out: UnboundedSender<OutMsg>,
@@ -484,13 +483,27 @@ impl Shard {
                         );
                     }
                 }
-                rs.book = Some(ReplicaBook {
+                let previous = rs.book.replace(ReplicaBook {
                     book,
                     exchange_ts: exchange_ts.unwrap_or(received_at),
                 });
                 match state.primary {
-                    // A fresh snapshot on the live source re-baselines it.
-                    Some(p) if p == r => self.emit_snapshot(&symbol, r, received_at),
+                    Some(p) if p == r => {
+                        // A snapshot on the live source: write the difference
+                        // as level updates so the output stays incremental.
+                        let rb = state.replicas[r].book.as_ref().unwrap();
+                        let exchange_ts = rb.exchange_ts;
+                        let changes = match &previous {
+                            Some(prev) => prev.book.diff(&rb.book),
+                            None => Vec::new(),
+                        };
+                        if previous.is_none() {
+                            self.emit_snapshot(&symbol, r, received_at);
+                        }
+                        for (side, price, qty) in changes {
+                            self.emit_update(&symbol, received_at, exchange_ts, side, price, qty);
+                        }
+                    }
                     None => {
                         state.primary = Some(r);
                         self.emit_snapshot(&symbol, r, received_at);
@@ -901,6 +914,17 @@ mod tests {
         let out = h.output();
         assert_eq!(out.len(), 1);
         assert_eq!(snapshot_bids(&out[0]), vec![(400_000, 10)]);
+    }
+
+    #[test]
+    fn snapshot_on_live_source_is_written_as_level_diff() {
+        let mut h = Harness::new(1);
+        h.snapshot(0, &[(400_000, 10), (390_000, 5)], &[(600_000, 2)]);
+        h.output();
+        h.snapshot(0, &[(400_000, 12)], &[(600_000, 2)]);
+        let mut updates: Vec<_> = h.output().iter().map(update).collect();
+        updates.sort_by_key(|&(side, price, _)| (side as u8, price));
+        assert_eq!(updates, vec![(Side::Buy, 390_000, 0), (Side::Buy, 400_000, 12)]);
     }
 
     #[test]

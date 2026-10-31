@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-use super::{FeedEvent, get_json, hash_key, millis_to_utc};
+use super::{Exchange, FeedEvent, Session, get_json, hash_key, millis_to_utc};
 use crate::Side;
 use crate::collector::book::LevelChange;
 use crate::collector::fixed::{SCALE, parse_fixed};
@@ -128,12 +128,14 @@ struct MarketInfo {
     status: String,
 }
 
-impl Kalshi {
-    pub fn name(&self) -> &'static str {
+impl Exchange for Kalshi {
+    type Session = KalshiSession;
+
+    fn name(&self) -> &'static str {
         "kalshi"
     }
 
-    pub fn connect_request(&self) -> anyhow::Result<Request> {
+    fn connect_request(&self) -> anyhow::Result<Request> {
         let mut request = self.ws_url.as_str().into_client_request()?;
         if let Some(creds) = &self.credentials {
             let timestamp = Utc::now().timestamp_millis().to_string();
@@ -154,18 +156,18 @@ impl Kalshi {
         Ok(request)
     }
 
-    pub fn new_session(&self) -> KalshiSession {
+    fn new_session(&self) -> KalshiSession {
         KalshiSession::default()
     }
 
     /// Not documented; measured on 2026-10-30: the 201st concurrent socket
     /// on one account is refused with HTTP 429.
-    pub fn max_connections(&self) -> Option<usize> {
+    fn max_connections(&self) -> Option<usize> {
         Some(200)
     }
 
     /// All open, non-multivariate markets.
-    pub async fn list_symbols(
+    async fn list_symbols(
         &self,
         http: &reqwest::Client,
         limit: Option<usize>,
@@ -452,8 +454,8 @@ fn levels(raw: &[(String, String)], invert: bool) -> anyhow::Result<Vec<(i64, i6
         .collect()
 }
 
-impl KalshiSession {
-    pub fn subscribe(&mut self, symbols: &[String], out: &mut Vec<String>) {
+impl Session for KalshiSession {
+    fn subscribe(&mut self, symbols: &[String], out: &mut Vec<String>) {
         let fresh: Vec<String> = symbols
             .iter()
             .filter(|t| !self.ticker_sid.contains_key(*t) && !self.ticker_pending.contains_key(*t))
@@ -481,11 +483,11 @@ impl KalshiSession {
         }
     }
 
-    pub fn unsubscribe(&mut self, symbols: &[String], out: &mut Vec<String>) {
+    fn unsubscribe(&mut self, symbols: &[String], out: &mut Vec<String>) {
         self.remove(symbols, false, out);
     }
 
-    pub fn resubscribe(&mut self, symbol: &str, events: &mut Vec<FeedEvent>, out: &mut Vec<String>) {
+    fn resubscribe(&mut self, symbol: &str, events: &mut Vec<FeedEvent>, out: &mut Vec<String>) {
         if self.ticker_pending.contains_key(symbol) {
             // A subscribe is already in flight; its snapshot will resync us.
             return;
@@ -497,7 +499,7 @@ impl KalshiSession {
         self.remove(&[symbol.to_owned()], true, out);
     }
 
-    pub fn decode(
+    fn decode(
         &mut self,
         text: &str,
         events: &mut Vec<FeedEvent>,

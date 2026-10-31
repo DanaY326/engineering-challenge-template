@@ -1,9 +1,19 @@
-//! The exchange layer: the Kalshi codec, and the normalized [`FeedEvent`]s
-//! it decodes frames into.
+//! The exchange-specific layer (Extension 3).
+//!
+//! Everything exchange-specific lives behind [`Exchange`] and [`Session`]:
+//! how to open an (authenticated) websocket, how to encode subscription
+//! commands, how to decode frames into normalized [`FeedEvent`]s, and how to
+//! list the symbols that should currently be collected. Sharding, redundancy,
+//! failover, monitoring, and output are generic over these traits.
 
 pub mod kalshi;
+pub mod polymarket;
+
+use std::future::Future;
 
 use chrono::{DateTime, Utc};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
 
 use super::book::LevelChange;
 use crate::Side;
@@ -37,6 +47,63 @@ pub enum FeedEvent {
     /// (e.g. already included in the latest snapshot). It still proves the
     /// subscription is live, for cross-replica monitoring.
     Seen { symbol: String, match_key: Option<u64> },
+}
+
+/// Static, shareable exchange configuration and REST access.
+pub trait Exchange: Send + Sync + 'static {
+    type Session: Session;
+
+    fn name(&self) -> &'static str;
+
+    /// Build the websocket handshake request, including any auth headers.
+    /// Called for every (re)connect, so signatures are always fresh.
+    fn connect_request(&self) -> anyhow::Result<Request>;
+
+    /// Fresh protocol state for one websocket connection.
+    fn new_session(&self) -> Self::Session;
+
+    /// Every symbol that should currently be collected. Each page is also
+    /// sent on `pages` as soon as it arrives, so collection can start before
+    /// a long listing finishes. Implementations may stop paginating once
+    /// they have `limit` symbols.
+    fn list_symbols(
+        &self,
+        http: &reqwest::Client,
+        limit: Option<usize>,
+        pages: UnboundedSender<Vec<String>>,
+    ) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
+
+    /// An application-level text heartbeat to send periodically, for
+    /// exchanges that do not rely on websocket ping frames.
+    fn app_heartbeat(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The most websockets the exchange allows us to hold open at once.
+    fn max_connections(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Per-connection protocol state. Methods push the text frames that must be
+/// sent to the exchange onto `out`.
+pub trait Session: Send + 'static {
+    fn subscribe(&mut self, symbols: &[String], out: &mut Vec<String>);
+
+    fn unsubscribe(&mut self, symbols: &[String], out: &mut Vec<String>);
+
+    /// Unsubscribe and subscribe again, forcing a fresh snapshot. Emits a
+    /// [`FeedEvent::Desync`] for the symbol, since updates between the two
+    /// commands are lost.
+    fn resubscribe(&mut self, symbol: &str, events: &mut Vec<FeedEvent>, out: &mut Vec<String>);
+
+    /// Decode one text frame. Returning an error tears down the connection.
+    fn decode(
+        &mut self,
+        text: &str,
+        events: &mut Vec<FeedEvent>,
+        out: &mut Vec<String>,
+    ) -> anyhow::Result<()>;
 }
 
 /// GET a JSON page, retrying rate limits (429) and server errors with
