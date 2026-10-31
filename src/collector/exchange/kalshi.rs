@@ -409,7 +409,8 @@ impl KalshiSession {
         let pending = id.and_then(|id| self.pending.remove(&id));
         match pending {
             Some(Pending::Subscribe(tickers)) => {
-                // Leave these unsubscribed until the socket reconnects.
+                // Leave these unsubscribed; the shard's sync monitor retries
+                // them one at a time, which isolates any bad ticker.
                 tracing::warn!(
                     code = err.code,
                     "Kalshi rejected subscribe for {} tickers (first {}): {}",

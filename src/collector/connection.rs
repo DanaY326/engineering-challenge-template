@@ -23,6 +23,8 @@ pub enum ConnCommand {
     Subscribe(Vec<String>),
     Unsubscribe(Vec<String>),
     Resubscribe(String),
+    /// Tear down and reconnect (periodic recycling, Extension 2).
+    Reconnect,
 }
 
 pub enum ConnMsg {
@@ -30,6 +32,7 @@ pub enum ConnMsg {
     Disconnected,
     Event {
         received_at: DateTime<Utc>,
+        received_mono: Instant,
         event: FeedEvent,
     },
 }
@@ -70,7 +73,7 @@ impl Connection {
                     self.symbols.remove(symbol);
                 }
             }
-            ConnCommand::Resubscribe(_) => {}
+            ConnCommand::Resubscribe(_) | ConnCommand::Reconnect => {}
         }
     }
 
@@ -145,15 +148,16 @@ impl Connection {
                 biased;
                 _ = self.cancel.cancelled() => break Exit::Shutdown,
                 frame = stream.next() => {
+                    let received_mono = Instant::now();
                     let received_at = Utc::now();
-                    last_rx = Instant::now();
+                    last_rx = received_mono;
                     match frame {
                         Some(Ok(Message::Text(text))) => {
                             if let Err(e) = session.decode(&text, &mut events, &mut out) {
                                 break Exit::Reconnect(format!("decode error: {e:#}; frame: {}", truncate(&text)));
                             }
                             for event in events.drain(..) {
-                                self.send(ConnMsg::Event { received_at, event });
+                                self.send(ConnMsg::Event { received_at, received_mono, event });
                             }
                         }
                         Some(Ok(Message::Close(frame))) => break Exit::Reconnect(format!("server closed: {frame:?}")),
@@ -175,12 +179,13 @@ impl Connection {
                     Some(ConnCommand::Resubscribe(symbol)) => {
                         if self.symbols.contains(&symbol) {
                             session.resubscribe(&symbol, &mut events, &mut out);
-                            let received_at = Utc::now();
+                            let now = (Utc::now(), Instant::now());
                             for event in events.drain(..) {
-                                self.send(ConnMsg::Event { received_at, event });
+                                self.send(ConnMsg::Event { received_at: now.0, received_mono: now.1, event });
                             }
                         }
                     }
+                    Some(ConnCommand::Reconnect) => break Exit::Reconnect("periodic recycle".to_owned()),
                 },
                 _ = heartbeat.tick() => {
                     if last_rx.elapsed() > self.cfg.read_timeout {

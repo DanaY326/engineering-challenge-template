@@ -62,7 +62,7 @@ discovery loop ──(add/remove symbols)──► shard 0..N ──► writer t
 |---|---|
 | `collector/exchange/` | The only exchange-specific code. `kalshi.rs`: auth, market discovery, subscribe/resubscribe, decoding into `Snapshot` / `Level` / `Desync`, sequence checks. |
 | `collector/connection.rs` | One websocket. It handles connect and reconnect with backoff, sends pings, and reconnects after 30 s of silence. It timestamps each frame as soon as it is read. |
-| `collector/shard.rs` | Runs ≤ `symbols_per_shard` symbols on one socket, keeping one book per symbol. It writes updates and minute snapshots, and resubscribes a symbol whose book diverges. |
+| `collector/shard.rs` | Runs ≤ `symbols_per_shard` symbols on one socket, keeping one book per symbol. It writes updates and minute snapshots, resubscribes a symbol whose book diverges, and monitors subscriptions. |
 | `collector/mod.rs` | The discovery loop. New symbols start collecting page by page as the listing streams in. Removals are applied only once the listing is complete, so a partial listing never unsubscribes live markets. |
 | `collector/output.rs` | The writer thread, so file I/O never stalls the network tasks. An output error, such as a full disk, shuts the collector down instead of silently dropping data. |
 | `bin/inspect.rs` | Reads an output file with the template's reader and checks it: no update before its symbol's first snapshot, no per-symbol timestamp going backwards, no crossed snapshot. |
@@ -96,16 +96,40 @@ that would be refused.
 - **Book integrity.** A delta that would make a level negative proves the
   book has diverged. That symbol is resubscribed on that socket.
 
+## Extension 2: subscription monitoring
+
+Every second, the shard checks each symbol:
+
+- **Never synced.** No snapshot 20 s after subscribing → resubscribe it.
+  Retries back off 20 s → 10 min. Single-ticker retries also isolate a bad
+  ticker that made a whole subscribe batch fail.
+- **Quiet compared with its own history.** Each symbol keeps an EWMA of the
+  time between updates. Silence longer than max(10 min, 30 × that gap)
+  triggers a resubscribe. The fresh snapshot is compared with the book we
+  held. A mismatch is logged as a "missed-data recovery" and counted. Repeat
+  checks back off up to 4 h, so dead markets cost almost nothing.
+- **Rate limit.** At most 20 monitoring-triggered resubscribes per socket
+  per second; the rest wait for the next tick. A burst, such as everything
+  after a reconnect, can't flood the exchange with commands.
+- **Periodic socket recycling.** Each socket reconnects about every 30 min
+  (±25% jitter). With one socket per shard this leaves a short gap, marked
+  by fresh snapshots; redundant sockets (Extension 1) would remove it.
+
+Each shard logs one summary line per minute: synced count, updates,
+snapshots, resubscribes, and recoveries.
+
 ## Verification
 
-- `cargo test --release` runs 14 unit tests:
+- `cargo test --release` runs 17 unit tests:
   - fixed-point parsing; book apply;
   - Kalshi decode, seq-gap recovery, the snapshot-clock filter, the
     resubscribe handshake and Ed25519 signing;
   - the shard's state machine, driven without sockets: snapshots and
     updates are written as absolute quantities; a desynced symbol goes dark
-    until its next snapshot; a diverged book is resubscribed; timestamps
-    stay monotonic; minute snapshots.
+    until its next snapshot; a diverged book is resubscribed; an unsynced
+    symbol is retried with backoff; resubscribes are rate-limited; a quiet
+    symbol is resubscribed and its snapshot verified; timestamps stay
+    monotonic; minute snapshots.
 - Live Kalshi run of this stage (200 markets on one socket, 80 s): every
   market synced, minute snapshots at :00, SIGINT closed the socket, flushed
   and exited 0, and `inspect` found the output clean (0 orphan updates, 0
@@ -113,12 +137,9 @@ that would be refused.
 
 ## Known limitations and next steps
 
-- One socket per shard: when it drops, its markets go dark until it
-  reconnects (the gap is marked by fresh snapshots). Redundant sockets would
-  remove these gaps.
-- Subscriptions are not monitored: a subscription the exchange rejects, or
-  one that silently stops delivering, is only fixed when the socket
-  reconnects.
+- One socket per shard: when it drops or is recycled, its markets go dark
+  until it reconnects (the gap is marked by fresh snapshots). Redundant
+  sockets would remove these gaps.
 - New markets are found by polling REST. A full Kalshi listing takes about
   75 s because of rate limits, so a new market is picked up within about
   2 min. Kalshi's `market_lifecycle_v2` channel would cut that to

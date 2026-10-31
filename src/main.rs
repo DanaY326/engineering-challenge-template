@@ -28,6 +28,10 @@ struct Cli {
     #[arg(long, default_value_t = 60)]
     discovery_interval_secs: u64,
 
+    /// Reconnect each socket roughly this often (±25% jitter).
+    #[arg(long, default_value_t = 1800)]
+    recycle_interval_secs: u64,
+
     /// Total websockets to open. Defaults to 95% of the exchange's limit
     /// (Kalshi: 200 per account); beyond it, shards grow past --symbols-per-shard.
     #[arg(long)]
@@ -68,6 +72,7 @@ fn main() -> anyhow::Result<()> {
         symbols_per_shard: cli.symbols_per_shard,
         max_symbols: cli.max_symbols,
         discovery_interval: Duration::from_secs(cli.discovery_interval_secs),
+        recycle_interval: Duration::from_secs(cli.recycle_interval_secs),
         max_connections: cli.max_connections,
         ..Config::default()
     };

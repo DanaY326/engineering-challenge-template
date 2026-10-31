@@ -30,6 +30,15 @@ pub struct Config {
     pub discovery_interval: Duration,
     /// Only collect this many symbols (for testing).
     pub max_symbols: Option<usize>,
+    /// Reconnect each socket roughly this often (±25% jitter).
+    pub recycle_interval: Duration,
+    /// Resubscribe a symbol that has not synced this long after subscribing.
+    pub sync_timeout: Duration,
+    pub max_retry_backoff: Duration,
+    /// A symbol is "quiet" after max(min_quiet, quiet_factor × its usual gap).
+    pub min_quiet: Duration,
+    pub quiet_factor: f64,
+    pub max_quiet_backoff: Duration,
     pub heartbeat_interval: Duration,
     /// Reconnect a socket that has received nothing (not even a pong) for this long.
     pub read_timeout: Duration,
@@ -45,6 +54,12 @@ impl Default for Config {
             symbols_per_shard: 250,
             discovery_interval: Duration::from_secs(60),
             max_symbols: None,
+            recycle_interval: Duration::from_secs(30 * 60),
+            sync_timeout: Duration::from_secs(20),
+            max_retry_backoff: Duration::from_secs(10 * 60),
+            min_quiet: Duration::from_secs(10 * 60),
+            quiet_factor: 30.0,
+            max_quiet_backoff: Duration::from_secs(4 * 60 * 60),
             heartbeat_interval: Duration::from_secs(10),
             read_timeout: Duration::from_secs(30),
             max_connections: None,
