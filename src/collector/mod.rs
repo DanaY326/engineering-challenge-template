@@ -1,8 +1,8 @@
 //! A Kalshi orderbook collector.
 //!
 //! [`run`] periodically lists Kalshi's live markets and spreads them
-//! across shards (see [`shard`]), each served by one websocket (see
-//! [`connection`]). Shards write snapshots and level updates to the
+//! across shards (see [`shard`]), each served by several redundant websockets
+//! (see [`connection`]). Shards write snapshots and level updates to the
 //! output channel consumed by [`output::spawn_writer`].
 
 pub mod book;
@@ -26,6 +26,8 @@ use shard::ShardCommand;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Redundant websockets per shard.
+    pub replicas: usize,
     pub symbols_per_shard: usize,
     pub discovery_interval: Duration,
     /// Only collect this many symbols (for testing).
@@ -35,6 +37,8 @@ pub struct Config {
     /// Resubscribe a symbol that has not synced this long after subscribing.
     pub sync_timeout: Duration,
     pub max_retry_backoff: Duration,
+    /// Resubscribe a replica that is this far behind another on a symbol.
+    pub stale_lag: Duration,
     /// A symbol is "quiet" after max(min_quiet, quiet_factor × its usual gap).
     pub min_quiet: Duration,
     pub quiet_factor: f64,
@@ -51,12 +55,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            replicas: 2,
             symbols_per_shard: 250,
             discovery_interval: Duration::from_secs(60),
             max_symbols: None,
             recycle_interval: Duration::from_secs(30 * 60),
             sync_timeout: Duration::from_secs(20),
             max_retry_backoff: Duration::from_secs(10 * 60),
+            stale_lag: Duration::from_secs(10),
             min_quiet: Duration::from_secs(10 * 60),
             quiet_factor: 30.0,
             max_quiet_backoff: Duration::from_secs(4 * 60 * 60),
@@ -99,9 +105,13 @@ pub async fn run(
     let budget = cfg
         .max_connections
         .or(exchange.max_connections().map(|limit| limit * 95 / 100));
-    let max_shards = budget.map(|budget| budget.max(1));
+    let max_shards = budget.map(|budget| (budget / cfg.replicas).max(1));
     if let Some(max_shards) = max_shards {
-        tracing::info!("{}: at most {max_shards} shards", exchange.name());
+        tracing::info!(
+            "{}: at most {max_shards} shards × {} sockets",
+            exchange.name(),
+            cfg.replicas
+        );
     }
     let mut collector = Collector {
         exchange,
@@ -271,10 +281,11 @@ impl Collector {
     fn log_changes(&self, added: usize, removed: usize) {
         if added > 0 || removed > 0 {
             tracing::info!(
-                "{}: +{added} -{removed} symbols; now {} symbols on {} shards",
+                "{}: +{added} -{removed} symbols; now {} symbols on {} shards × {} sockets",
                 self.exchange.name(),
                 self.assignment.len(),
                 self.shards.len(),
+                self.cfg.replicas,
             );
         }
     }

@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-use super::{FeedEvent, get_json, millis_to_utc};
+use super::{FeedEvent, get_json, hash_key, millis_to_utc};
 use crate::Side;
 use crate::collector::book::LevelChange;
 use crate::collector::fixed::{SCALE, parse_fixed};
@@ -543,10 +543,17 @@ impl KalshiSession {
                     "no" => (Side::Sell, SCALE - price),
                     other => bail!("unknown Kalshi side {other:?}"),
                 };
+                let match_key = delta
+                    .clock
+                    .map(|clock| hash_key((&delta.market_ticker, clock, side as u8, price, qty)));
                 if let (Some(clock), Some(&snapshot)) =
                     (delta.clock, self.snapshot_clock.get(&delta.market_ticker))
                 {
                     if clock <= snapshot {
+                        events.push(FeedEvent::Seen {
+                            symbol: delta.market_ticker,
+                            match_key,
+                        });
                         return Ok(());
                     }
                     // Only the first deltas after a snapshot can overlap it;
@@ -555,6 +562,7 @@ impl KalshiSession {
                     self.snapshot_clock.remove(&delta.market_ticker);
                 }
                 events.push(FeedEvent::Level {
+                    match_key,
                     exchange_ts: delta
                         .ts_ms
                         .or(env.sending_ts_ms)
@@ -627,13 +635,14 @@ mod tests {
             &mut s,
             r#"{"type": "orderbook_delta", "sending_ts_ms": 1669149841123, "sid": 2, "seq": 2, "msg": {"market_ticker": "FED", "clock": 4182061, "price_dollars": "0.9600", "delta_fp": "-54.00", "side": "no", "ts": "2022-11-22T20:44:01Z", "ts_ms": 1669149841000}}"#,
         );
-        let FeedEvent::Level { side, price, change, exchange_ts, .. } = &events[0] else {
+        let FeedEvent::Level { side, price, change, exchange_ts, match_key, .. } = &events[0] else {
             panic!("{events:?}")
         };
         assert_eq!(*side, Side::Sell);
         assert_eq!(*price, 40_000);
         assert_eq!(*change, LevelChange::Delta(-54_000_000));
         assert_eq!(exchange_ts.unwrap().timestamp_millis(), 1669149841000);
+        assert!(match_key.is_some());
     }
 
     #[test]
@@ -643,8 +652,8 @@ mod tests {
             format!(r#"{{"type": "orderbook_delta", "sid": 2, "seq": {seq}, "msg": {{"market_ticker": "FED", "clock": {clock}, "price_dollars": "0.5", "delta_fp": "-1", "side": "yes"}}}}"#)
         };
         decode(&mut s, r#"{"type": "orderbook_snapshot", "sid": 2, "seq": 1, "msg": {"market_ticker": "FED", "clock": 100, "yes_dollars_fp": [["0.5", "1"]]}}"#);
-        assert!(decode(&mut s, &delta(2, 99)).0.is_empty());
-        assert!(decode(&mut s, &delta(3, 100)).0.is_empty());
+        assert!(matches!(decode(&mut s, &delta(2, 99)).0.as_slice(), [FeedEvent::Seen { .. }]));
+        assert!(matches!(decode(&mut s, &delta(3, 100)).0.as_slice(), [FeedEvent::Seen { .. }]));
         assert_eq!(decode(&mut s, &delta(4, 101)).0.len(), 1);
         // After the first newer delta, clocks are no longer compared.
         assert_eq!(decode(&mut s, &delta(5, 7)).0.len(), 1);

@@ -1,13 +1,17 @@
-//! A shard: a set of symbols served by one websocket.
+//! A shard: a set of symbols served by `cfg.replicas` redundant websockets.
 //!
-//! The shard keeps a book per symbol, writes every level update, and writes a
-//! snapshot of every synced book at each wall-clock minute.
+//! Every replica keeps its own book per symbol. Exactly one synced replica per
+//! symbol is the *primary*, and only its updates are written out. Whenever the
+//! primary changes we write a snapshot first, since the replicas' books may
+//! differ (Extension 1).
 //!
-//! It also monitors subscriptions (Extension 2):
-//! - a symbol that never syncs is resubscribed, with backoff;
-//! - a symbol that is quiet compared to its own history is resubscribed, and
-//!   the fresh snapshot is checked against our book;
-//! - the socket is recycled periodically.
+//! The shard also monitors subscriptions (Extension 2):
+//! - a replica that never syncs a symbol is resubscribed, with backoff;
+//! - a replica that lags another replica on a symbol is resubscribed;
+//! - a symbol that is quiet compared to its own history is resubscribed on
+//!   one replica, and the fresh snapshot is checked against our book;
+//! - whole sockets are recycled periodically, one at a time, while the other
+//!   replicas are healthy.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -21,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::Config;
 use super::book::Book;
-use super::connection::{ConnCommand, ConnMsg, Connection};
+use super::connection::{ConnCommand, Connection, ReplicaMsg, ReplicaMsgKind};
 use super::exchange::FeedEvent;
 use super::exchange::kalshi::Kalshi;
 use super::output::OutMsg;
@@ -33,14 +37,20 @@ pub enum ShardCommand {
     Remove(Vec<String>),
 }
 
-struct SyncedBook {
+struct ReplicaBook {
     book: Book,
     exchange_ts: DateTime<Utc>,
 }
 
-struct SymbolState {
-    book: Option<SyncedBook>,
+/// One replica's view of one symbol.
+struct ReplicaSymbol {
+    book: Option<ReplicaBook>,
     last_event: Option<Instant>,
+    /// Last level update (not snapshot): proof the subscription is live.
+    last_level: Option<Instant>,
+    /// When the current book was synced from a snapshot.
+    synced_at: Option<Instant>,
+
     /// When we last (re)subscribed; the sync deadline is measured from here.
     requested_at: Instant,
     /// No monitoring-triggered resubscribe before this.
@@ -49,41 +59,108 @@ struct SymbolState {
     /// After a quiet-check resubscribe: the book to compare the fresh
     /// snapshot against.
     verify: Option<Book>,
-    /// EWMA of the time between updates, in seconds.
+}
+
+struct SymbolState {
+    replicas: Vec<ReplicaSymbol>,
+    primary: Option<usize>,
+    /// EWMA of the time between primary updates, in seconds.
     ewma_gap: Option<f64>,
-    last_update: Option<Instant>,
+    last_primary_update: Option<Instant>,
     quiet_check_at: Instant,
     quiet_backoff: Duration,
+    next_quiet_replica: usize,
     /// The latest timestamp written for this symbol; output timestamps are
     /// kept monotonic per symbol.
     last_emitted: Option<DateTime<Utc>>,
+    /// Updates (by match key) not yet received equally by every replica:
+    /// `(key, first received, times each replica received it)`. Counts, not
+    /// a bitmask, because the same key can legitimately occur twice. Healthy
+    /// replicas catch up within milliseconds; an entry where a synced replica
+    /// is still short after `stale_lag` means it is missing data.
+    unmatched: Vec<(u64, Instant, Vec<u16>)>,
 }
 
 impl SymbolState {
+    /// Replica `r` received the update identified by `key`.
+    fn record_update(&mut self, key: u64, r: usize, at: Instant) {
+        if self.replicas.len() < 2 {
+            return;
+        }
+        let i = match self.unmatched.iter().position(|(k, _, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                self.unmatched.push((key, at, vec![0; self.replicas.len()]));
+                self.unmatched.len() - 1
+            }
+        };
+        let counts = &mut self.unmatched[i].2;
+        counts[r] = counts[r].saturating_add(1);
+        if counts.iter().all(|&c| c == counts[0]) {
+            self.unmatched.swap_remove(i);
+        }
+    }
+
+    /// How long ago another replica received an update that synced replica
+    /// `r` still hasn't, if that is longer than `stale_lag`. Updates from
+    /// before `r`'s latest snapshot are covered by that snapshot.
+    fn missed_update(&self, r: usize, stale_lag: Duration, now: Instant) -> Option<Duration> {
+        let synced_at = self.replicas[r].synced_at?;
+        self.unmatched
+            .iter()
+            .filter(|(_, at, counts)| {
+                *at > synced_at && counts[r] < counts.iter().copied().max().unwrap_or(0)
+            })
+            .map(|(_, at, _)| now - *at)
+            .filter(|&age| age > stale_lag)
+            .max()
+    }
+
+    /// Forget updates old enough to have been judged already.
+    fn expire_unmatched(&mut self, stale_lag: Duration, now: Instant) {
+        self.unmatched.retain(|(_, at, _)| now - *at <= stale_lag * 2);
+    }
+
     fn new(cfg: &Config, now: Instant) -> Self {
         Self {
-            book: None,
-            last_event: None,
-            requested_at: now,
-            retry_at: now + cfg.sync_timeout,
-            retry_backoff: cfg.sync_timeout,
-            verify: None,
+            replicas: (0..cfg.replicas)
+                .map(|_| ReplicaSymbol {
+                    book: None,
+                    last_event: None,
+                    requested_at: now,
+                    retry_at: now + cfg.sync_timeout,
+                    retry_backoff: cfg.sync_timeout,
+                    verify: None,
+                    last_level: None,
+                    synced_at: None,
+                })
+                .collect(),
+            primary: None,
             ewma_gap: None,
-            last_update: None,
+            last_primary_update: None,
             quiet_check_at: now + cfg.min_quiet,
             quiet_backoff: cfg.min_quiet,
+            next_quiet_replica: 0,
             last_emitted: None,
+            unmatched: Vec::new(),
         }
     }
 }
 
-/// Most monitoring-triggered resubscribes per health check (1 s).
+struct Replica {
+    tx: UnboundedSender<ConnCommand>,
+    connected_since: Option<Instant>,
+    recycle_after: Duration,
+}
+
+/// Most monitoring-triggered resubscribes per socket per health check (1 s).
 const MAX_RESUBSCRIBES_PER_TICK: usize = 20;
 
 #[derive(Default)]
 struct Counters {
     updates: u64,
     snapshots: u64,
+    switches: u64,
     resubscribes: u64,
     recovered: u64,
 }
@@ -92,19 +169,19 @@ pub struct Shard {
     id: usize,
     cfg: Arc<Config>,
     out: UnboundedSender<OutMsg>,
-    tx: UnboundedSender<ConnCommand>,
-    connected_since: Option<Instant>,
-    recycle_after: Duration,
+    replicas: Vec<Replica>,
     symbols: HashMap<String, SymbolState>,
     counters: Counters,
+    last_recycle: Instant,
     /// Everything received up to this time has been applied: the latest
-    /// receive time processed, or "now" when no events are queued. Minute
-    /// snapshots are stamped with it, since stamping them with the wall clock
-    /// would put them after queued events that were received earlier.
+    /// receive time processed, or "now" when no events are queued. Snapshots
+    /// we generate (failover, minute) are stamped with it, since stamping
+    /// them with the wall clock would put them after queued events that were
+    /// received earlier.
     as_of: DateTime<Utc>,
 }
 
-/// Spawn a shard and its websocket connection.
+/// Spawn a shard and its replica connections.
 pub fn spawn(
     id: usize,
     exchange: Arc<Kalshi>,
@@ -115,28 +192,38 @@ pub fn spawn(
 ) -> (UnboundedSender<ShardCommand>, JoinHandle<()>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let (tx, commands) = mpsc::unbounded_channel();
-    let connection = Connection {
-        exchange,
-        cfg: cfg.clone(),
-        shard: id,
-        symbols: symbols.iter().cloned().collect::<BTreeSet<_>>(),
-        commands,
-        events: event_tx,
-        cancel: cancel.clone(),
-    };
-    let connection = tokio::spawn(connection.run());
 
-    let shard = Shard::new(id, cfg, out, tx, symbols);
+    let mut replica_txs = Vec::new();
+    let mut connections = Vec::new();
+    for replica in 0..cfg.replicas {
+        let (tx, commands) = mpsc::unbounded_channel();
+        let connection = Connection {
+            exchange: exchange.clone(),
+            cfg: cfg.clone(),
+            shard: id,
+            replica,
+            symbols: symbols.iter().cloned().collect::<BTreeSet<_>>(),
+            commands,
+            events: event_tx.clone(),
+            cancel: cancel.clone(),
+        };
+        connections.push(tokio::spawn(connection.run()));
+        replica_txs.push(tx);
+    }
+    drop(event_tx);
+
+    let shard = Shard::new(id, cfg, out, replica_txs, symbols);
     let handle = tokio::spawn(async move {
         shard.run(cmd_rx, event_rx, cancel).await;
-        // Wait for the websocket to close before the output is closed.
-        let _ = connection.await;
+        // Wait for every websocket to close before the output is closed.
+        for connection in connections {
+            let _ = connection.await;
+        }
     });
     (cmd_tx, handle)
 }
 
-/// Spread recycles out so sockets don't reconnect in lockstep.
+/// Spread recycles out so replicas never line up.
 fn jittered(base: Duration) -> Duration {
     base.mul_f64(rand::thread_rng().gen_range(0.75..1.25))
 }
@@ -151,7 +238,7 @@ impl Shard {
         id: usize,
         cfg: Arc<Config>,
         out: UnboundedSender<OutMsg>,
-        tx: UnboundedSender<ConnCommand>,
+        replica_txs: Vec<UnboundedSender<ConnCommand>>,
         symbols: Vec<String>,
     ) -> Self {
         let now = Instant::now();
@@ -161,12 +248,18 @@ impl Shard {
                 .into_iter()
                 .map(|s| (s, SymbolState::new(&cfg, now)))
                 .collect(),
-            tx,
-            connected_since: None,
-            recycle_after: jittered(cfg.recycle_interval),
+            replicas: replica_txs
+                .into_iter()
+                .map(|tx| Replica {
+                    tx,
+                    connected_since: None,
+                    recycle_after: jittered(cfg.recycle_interval),
+                })
+                .collect(),
             cfg,
             out,
             counters: Counters::default(),
+            last_recycle: now,
             as_of: Utc::now(),
         }
     }
@@ -174,7 +267,7 @@ impl Shard {
     async fn run(
         mut self,
         mut commands: UnboundedReceiver<ShardCommand>,
-        mut events: UnboundedReceiver<ConnMsg>,
+        mut events: UnboundedReceiver<ReplicaMsg>,
         cancel: CancellationToken,
     ) {
         let mut health = tokio::time::interval(Duration::from_secs(1));
@@ -185,7 +278,7 @@ impl Shard {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                Some(msg) = events.recv() => self.on_conn_msg(msg),
+                Some(msg) = events.recv() => self.on_replica_msg(msg),
                 command = commands.recv() => match command {
                     Some(ShardCommand::Add(symbols)) => self.add(symbols),
                     Some(ShardCommand::Remove(symbols)) => self.remove(symbols),
@@ -214,24 +307,30 @@ impl Shard {
             self.symbols
                 .insert(symbol.clone(), SymbolState::new(&self.cfg, now));
         }
-        let _ = self.tx.send(ConnCommand::Subscribe(fresh));
+        for replica in &self.replicas {
+            let _ = replica.tx.send(ConnCommand::Subscribe(fresh.clone()));
+        }
     }
 
     fn remove(&mut self, symbols: Vec<String>) {
         for symbol in &symbols {
             self.symbols.remove(symbol);
         }
-        let _ = self.tx.send(ConnCommand::Unsubscribe(symbols));
+        for replica in &self.replicas {
+            let _ = replica.tx.send(ConnCommand::Unsubscribe(symbols.clone()));
+        }
     }
 
     /// With no events queued, everything received so far has been applied.
-    fn catch_up(&mut self, events: &UnboundedReceiver<ConnMsg>) {
+    fn catch_up(&mut self, events: &UnboundedReceiver<ReplicaMsg>) {
         if events.is_empty() {
             self.as_of = self.as_of.max(Utc::now());
         }
     }
 
-    /// Clamp `ts` so this symbol's output timestamps never go backwards.
+    /// Clamp `ts` so this symbol's output timestamps never go backwards. Only
+    /// moves a timestamp when events from different sockets race through the
+    /// shard's queue, by at most that race.
     fn monotonic(&mut self, symbol: &str, ts: DateTime<Utc>) -> DateTime<Utc> {
         let Some(state) = self.symbols.get_mut(symbol) else {
             return ts;
@@ -241,13 +340,13 @@ impl Shard {
         ts
     }
 
-    fn emit_snapshot(&mut self, symbol: &str, received_at: DateTime<Utc>) {
-        if self.symbols[symbol].book.is_none() {
+    fn emit_snapshot(&mut self, symbol: &str, replica: usize, received_at: DateTime<Utc>) {
+        if self.symbols[symbol].replicas[replica].book.is_none() {
             return;
         }
         let received_at = self.monotonic(symbol, received_at);
-        let sb = self.symbols[symbol].book.as_ref().unwrap();
-        let snapshot = sb.book.to_snapshot(symbol, received_at, sb.exchange_ts);
+        let rb = self.symbols[symbol].replicas[replica].book.as_ref().unwrap();
+        let snapshot = rb.book.to_snapshot(symbol, received_at, rb.exchange_ts);
         self.counters.snapshots += 1;
         let _ = self.out.send(OutMsg::Snapshot(snapshot));
     }
@@ -273,52 +372,88 @@ impl Shard {
         }));
     }
 
-    /// Invalidate the symbol's book and ask the socket to resubscribe it.
-    fn resubscribe(&mut self, symbol: &str, verify: bool, reason: &str) {
+    /// Make the freshest synced replica the primary, writing its snapshot.
+    /// Called whenever the current primary can no longer be trusted.
+    fn failover(&mut self, symbol: &str, reason: &str) {
+        let Some(state) = self.symbols.get_mut(symbol) else {
+            return;
+        };
+        let old = state.primary;
+        let candidate = (0..state.replicas.len())
+            .filter(|&r| Some(r) != old && state.replicas[r].book.is_some())
+            .max_by_key(|&r| state.replicas[r].last_event);
+        state.primary = candidate;
+        match candidate {
+            Some(new) => {
+                self.counters.switches += 1;
+                tracing::debug!(shard = self.id, symbol, ?old, new, "switching source: {reason}");
+                self.emit_snapshot(symbol, new, self.as_of);
+            }
+            None => tracing::debug!(shard = self.id, symbol, ?old, "no synced source: {reason}"),
+        }
+    }
+
+    /// Invalidate `replica`'s book and ask it to resubscribe.
+    fn resubscribe(&mut self, symbol: &str, replica: usize, verify: bool, reason: &str) {
         let now = Instant::now();
         let Some(state) = self.symbols.get_mut(symbol) else {
             return;
         };
-        let old = state.book.take();
-        state.verify = old.filter(|_| verify).map(|sb| sb.book);
-        state.requested_at = now;
-        state.retry_at = now + state.retry_backoff;
-        state.retry_backoff = (state.retry_backoff * 2).min(self.cfg.max_retry_backoff);
+        let rs = &mut state.replicas[replica];
+        let old = rs.book.take();
+        rs.verify = old.filter(|_| verify).map(|rb| rb.book);
+        rs.requested_at = now;
+        rs.retry_at = now + rs.retry_backoff;
+        rs.retry_backoff = (rs.retry_backoff * 2).min(self.cfg.max_retry_backoff);
+        let was_primary = state.primary == Some(replica);
         self.counters.resubscribes += 1;
-        tracing::debug!(shard = self.id, symbol, "resubscribing: {reason}");
-        let _ = self.tx.send(ConnCommand::Resubscribe(symbol.to_owned()));
+        tracing::debug!(shard = self.id, symbol, replica, "resubscribing: {reason}");
+        let _ = self.replicas[replica]
+            .tx
+            .send(ConnCommand::Resubscribe(symbol.to_owned()));
+        if was_primary {
+            self.failover(symbol, reason);
+        }
     }
 
-    fn on_conn_msg(&mut self, msg: ConnMsg) {
+    fn on_replica_msg(&mut self, msg: ReplicaMsg) {
+        let r = msg.replica;
         let now = Instant::now();
-        match msg {
-            ConnMsg::Connected => {
-                self.connected_since = Some(now);
+        match msg.kind {
+            ReplicaMsgKind::Connected => {
+                self.replicas[r].connected_since = Some(now);
                 for state in self.symbols.values_mut() {
-                    state.requested_at = now;
-                    state.retry_at = now + self.cfg.sync_timeout;
-                    state.retry_backoff = self.cfg.sync_timeout;
+                    let rs = &mut state.replicas[r];
+                    rs.requested_at = now;
+                    rs.retry_at = now + self.cfg.sync_timeout;
+                    rs.retry_backoff = self.cfg.sync_timeout;
                 }
             }
-            ConnMsg::Disconnected => {
-                // Every book is stale until the reconnect's snapshots arrive.
-                self.connected_since = None;
-                for state in self.symbols.values_mut() {
-                    state.book = None;
+            ReplicaMsgKind::Disconnected => {
+                self.replicas[r].connected_since = None;
+                let mut orphaned = Vec::new();
+                for (symbol, state) in &mut self.symbols {
+                    state.replicas[r].book = None;
+                    if state.primary == Some(r) {
+                        orphaned.push(symbol.clone());
+                    }
+                }
+                for symbol in orphaned {
+                    self.failover(&symbol, "primary disconnected");
                 }
             }
-            ConnMsg::Event {
+            ReplicaMsgKind::Event {
                 received_at,
                 received_mono,
                 event,
             } => {
                 self.as_of = self.as_of.max(received_at);
-                self.on_event(received_at, received_mono, event);
+                self.on_event(r, received_at, received_mono, event);
             }
         }
     }
 
-    fn on_event(&mut self, received_at: DateTime<Utc>, mono: Instant, event: FeedEvent) {
+    fn on_event(&mut self, r: usize, received_at: DateTime<Utc>, mono: Instant, event: FeedEvent) {
         match event {
             FeedEvent::Snapshot {
                 symbol,
@@ -335,22 +470,33 @@ impl Shard {
                 {
                     tracing::debug!(shard = self.id, symbol, bid, ask, "crossed book in snapshot");
                 }
-                state.last_event = Some(mono);
-                if let Some(expected) = state.verify.take() {
+                let rs = &mut state.replicas[r];
+                rs.last_event = Some(mono);
+                rs.synced_at = Some(mono);
+                if let Some(expected) = rs.verify.take() {
                     if expected != book {
                         self.counters.recovered += 1;
                         tracing::warn!(
                             shard = self.id,
                             symbol,
+                            replica = r,
                             "quiet-check resubscribe found a different book; updates were missed"
                         );
                     }
                 }
-                state.book = Some(SyncedBook {
+                rs.book = Some(ReplicaBook {
                     book,
                     exchange_ts: exchange_ts.unwrap_or(received_at),
                 });
-                self.emit_snapshot(&symbol, received_at);
+                match state.primary {
+                    // A fresh snapshot on the live source re-baselines it.
+                    Some(p) if p == r => self.emit_snapshot(&symbol, r, received_at),
+                    None => {
+                        state.primary = Some(r);
+                        self.emit_snapshot(&symbol, r, received_at);
+                    }
+                    Some(_) => {}
+                }
             }
             FeedEvent::Level {
                 symbol,
@@ -358,135 +504,216 @@ impl Shard {
                 side,
                 price,
                 change,
+                match_key,
             } => {
                 let Some(state) = self.symbols.get_mut(&symbol) else {
                     return;
                 };
-                state.last_event = Some(mono);
-                let Some(sb) = state.book.as_mut() else {
+                if let Some(key) = match_key {
+                    state.record_update(key, r, mono);
+                }
+                let rs = &mut state.replicas[r];
+                rs.last_event = Some(mono);
+                rs.last_level = Some(mono);
+                let Some(rb) = rs.book.as_mut() else {
                     return;
                 };
-                match sb.book.apply(side, price, change) {
+                match rb.book.apply(side, price, change) {
                     Ok(quantity) => {
                         let exchange_ts = exchange_ts.unwrap_or(received_at);
-                        sb.exchange_ts = exchange_ts;
-                        state.retry_backoff = self.cfg.sync_timeout;
-                        if let Some(last) = state.last_update {
-                            let gap = mono.saturating_duration_since(last).as_secs_f64();
-                            state.ewma_gap =
-                                Some(state.ewma_gap.map_or(gap, |e| 0.9 * e + 0.1 * gap));
+                        rb.exchange_ts = exchange_ts;
+                        rs.retry_backoff = self.cfg.sync_timeout;
+                        if state.primary == Some(r) {
+                            if let Some(last) = state.last_primary_update {
+                                let gap = mono.saturating_duration_since(last).as_secs_f64();
+                                state.ewma_gap =
+                                    Some(state.ewma_gap.map_or(gap, |e| 0.9 * e + 0.1 * gap));
+                            }
+                            state.last_primary_update = Some(mono);
+                            state.quiet_backoff = self.cfg.min_quiet;
+                            self.emit_update(&symbol, received_at, exchange_ts, side, price, quantity);
                         }
-                        state.last_update = Some(mono);
-                        state.quiet_backoff = self.cfg.min_quiet;
-                        self.emit_update(&symbol, received_at, exchange_ts, side, price, quantity);
                     }
                     Err(e) => {
-                        tracing::warn!(shard = self.id, symbol, "book diverged: {e}");
-                        self.resubscribe(&symbol, false, "book diverged");
+                        tracing::warn!(shard = self.id, symbol, replica = r, "book diverged: {e}");
+                        self.resubscribe(&symbol, r, false, "book diverged");
+                    }
+                }
+            }
+            FeedEvent::Seen { symbol, match_key } => {
+                if let Some(state) = self.symbols.get_mut(&symbol) {
+                    state.replicas[r].last_event = Some(mono);
+                    if let Some(key) = match_key {
+                        state.record_update(key, r, mono);
                     }
                 }
             }
             FeedEvent::Desync { symbols, reason } => {
                 if symbols.len() > 1 {
-                    tracing::info!(shard = self.id, "{} symbols desynced: {reason}", symbols.len());
+                    tracing::info!(shard = self.id, replica = r, "{} symbols desynced: {reason}", symbols.len());
                 }
-                let now = Instant::now();
                 for symbol in symbols {
                     let Some(state) = self.symbols.get_mut(&symbol) else {
                         continue;
                     };
-                    state.book = None;
-                    state.requested_at = now;
-                    state.retry_at = state.retry_at.max(now + self.cfg.sync_timeout);
+                    let now = Instant::now();
+                    let rs = &mut state.replicas[r];
+                    rs.book = None;
+                    rs.requested_at = now;
+                    rs.retry_at = rs.retry_at.max(now + self.cfg.sync_timeout);
+                    if state.primary == Some(r) {
+                        self.failover(&symbol, &reason);
+                    }
                 }
             }
         }
     }
 
     fn health_check(&mut self) {
-        if self.connected_since.is_none() {
-            return;
-        }
         let now = Instant::now();
-        let mut actions: Vec<(String, bool, String)> = Vec::new();
+        let connected: Vec<bool> = self
+            .replicas
+            .iter()
+            .map(|r| r.connected_since.is_some())
+            .collect();
+        let mut actions: Vec<(String, usize, bool, String)> = Vec::new();
 
         for (symbol, state) in &mut self.symbols {
-            if state.book.is_none() && now >= state.retry_at {
-                actions.push((symbol.clone(), false, format!(
-                    "not synced {:?} after subscribing",
-                    now - state.requested_at
-                )));
+            let newest = state.replicas.iter().filter_map(|rs| rs.last_event).max();
+            for (r, rs) in state.replicas.iter().enumerate() {
+                if !connected[r] || now < rs.retry_at {
+                    continue;
+                }
+                if rs.book.is_none() {
+                    actions.push((symbol.clone(), r, false, format!(
+                        "not synced {:?} after subscribing",
+                        now - rs.requested_at
+                    )));
+                } else if let Some(missed) = state.missed_update(r, self.cfg.stale_lag, now) {
+                    actions.push((symbol.clone(), r, false, format!(
+                        "missed an update another replica received {missed:.0?} ago"
+                    )));
+                }
             }
+            state.expire_unmatched(self.cfg.stale_lag, now);
 
-            // Quiet relative to the symbol's own history: resubscribe and
-            // verify the fresh snapshot.
-            let silence = now - state.last_event.unwrap_or(state.requested_at);
+            // Quiet relative to the symbol's own history: resubscribe one
+            // synced replica and verify its fresh snapshot.
+            let silence = now - newest.unwrap_or(state.replicas[0].requested_at);
             let threshold = state
                 .ewma_gap
                 .map(|gap| Duration::from_secs_f64(gap * self.cfg.quiet_factor))
                 .unwrap_or_default()
                 .max(self.cfg.min_quiet);
             if silence > threshold && now >= state.quiet_check_at {
-                if state.book.is_some() {
-                    actions.push((symbol.clone(), true, format!("quiet for {silence:?}")));
+                // Prefer a non-primary replica so the output source is not
+                // disturbed; fall back to the primary if it is the only one.
+                let n = state.replicas.len();
+                let candidates: Vec<usize> = (0..n)
+                    .map(|i| (state.next_quiet_replica + i) % n)
+                    .filter(|&r| connected[r] && state.replicas[r].book.is_some())
+                    .collect();
+                let pick = candidates
+                    .iter()
+                    .copied()
+                    .find(|&r| Some(r) != state.primary)
+                    .or(candidates.first().copied());
+                if let Some(r) = pick {
+                    state.next_quiet_replica = (r + 1) % n;
+                    actions.push((symbol.clone(), r, true, format!("quiet for {silence:?}")));
                 }
                 state.quiet_check_at = now + state.quiet_backoff;
                 state.quiet_backoff = (state.quiet_backoff * 2).min(self.cfg.max_quiet_backoff);
             }
         }
-        // Cap resubscribes per tick so a burst (e.g. after a reconnect) can't
-        // flood the exchange with commands; the rest are still due and go out
-        // on the next ticks.
-        let mut budget = MAX_RESUBSCRIBES_PER_TICK;
+        // Cap resubscribes per socket per tick so a burst (e.g. after a
+        // reconnect) can't flood the exchange with commands; the rest are
+        // still due and go out on the next ticks.
+        let mut budget = vec![MAX_RESUBSCRIBES_PER_TICK; self.replicas.len()];
         let mut deferred = 0;
-        for (symbol, verify, reason) in actions {
-            if budget == 0 {
+        for (symbol, r, verify, reason) in actions {
+            if budget[r] == 0 {
                 deferred += 1;
                 continue;
             }
-            budget -= 1;
-            self.resubscribe(&symbol, verify, &reason);
+            budget[r] -= 1;
+            self.resubscribe(&symbol, r, verify, &reason);
         }
         if deferred > 0 {
             tracing::debug!(shard = self.id, deferred, "resubscribes deferred to later ticks");
         }
 
-        self.maybe_recycle(now);
+        self.maybe_recycle(now, &connected);
     }
 
-    /// Reconnect the socket periodically, to shed any state that degrades
-    /// over a long-lived connection on either side.
-    fn maybe_recycle(&mut self, now: Instant) {
-        let Some(since) = self.connected_since else {
+    /// Recycle at most one socket at a time, and only while every other
+    /// replica is connected and mostly synced, so we never lose coverage.
+    fn maybe_recycle(&mut self, now: Instant, connected: &[bool]) {
+        if self.replicas.len() < 2 || now - self.last_recycle < Duration::from_secs(60) {
             return;
-        };
-        if now - since >= self.recycle_after {
-            tracing::info!(shard = self.id, "recycling socket");
-            self.recycle_after = jittered(self.cfg.recycle_interval);
-            let _ = self.tx.send(ConnCommand::Reconnect);
+        }
+        let total = self.symbols.len().max(1);
+        let synced: Vec<usize> = (0..self.replicas.len())
+            .map(|r| {
+                self.symbols
+                    .values()
+                    .filter(|s| s.replicas[r].book.is_some())
+                    .count()
+            })
+            .collect();
+        for r in 0..self.replicas.len() {
+            let Some(since) = self.replicas[r].connected_since else {
+                continue;
+            };
+            if now - since < self.replicas[r].recycle_after {
+                continue;
+            }
+            let others_healthy = (0..self.replicas.len())
+                .filter(|&o| o != r)
+                .all(|o| connected[o] && synced[o] * 10 >= total * 9);
+            if others_healthy {
+                tracing::info!(shard = self.id, replica = r, "recycling socket");
+                self.replicas[r].recycle_after = jittered(self.cfg.recycle_interval);
+                let _ = self.replicas[r].tx.send(ConnCommand::Reconnect);
+                self.last_recycle = now;
+                return;
+            }
         }
     }
 
     fn minute_tick(&mut self) {
         let received_at = self.as_of;
-        let synced: Vec<String> = self
+        let mut no_source = 0;
+        let symbols: Vec<(String, Option<usize>)> = self
             .symbols
             .iter()
-            .filter(|(_, state)| state.book.is_some())
-            .map(|(symbol, _)| symbol.clone())
+            .map(|(s, state)| (s.clone(), state.primary))
             .collect();
-        for symbol in &synced {
-            self.emit_snapshot(symbol, received_at);
+        for (symbol, primary) in symbols {
+            match primary {
+                Some(p) => self.emit_snapshot(&symbol, p, received_at),
+                None => no_source += 1,
+            }
         }
 
+        let synced: Vec<usize> = (0..self.replicas.len())
+            .map(|r| {
+                self.symbols
+                    .values()
+                    .filter(|s| s.replicas[r].book.is_some())
+                    .count()
+            })
+            .collect();
         let c = &self.counters;
         tracing::info!(
-            "shard {}: {} symbols, synced {}, updates {}, snapshots {}, resubscribes {}, missed-data recoveries {}",
+            "shard {}: {} symbols, synced per replica {:?}, no source {}, updates {}, snapshots {}, switches {}, resubscribes {}, missed-data recoveries {}",
             self.id,
             self.symbols.len(),
-            synced.len(),
+            synced,
+            no_source,
             c.updates,
             c.snapshots,
+            c.switches,
             c.resubscribes,
             c.recovered,
         );
@@ -504,16 +731,25 @@ mod tests {
     struct Harness {
         shard: Shard,
         out: UnboundedReceiver<OutMsg>,
-        commands: UnboundedReceiver<ConnCommand>,
+        commands: Vec<UnboundedReceiver<ConnCommand>>,
     }
 
     impl Harness {
-        fn new() -> Self {
-            let cfg = Arc::new(Config::default());
+        fn new(replicas: usize) -> Self {
+            let cfg = Arc::new(Config {
+                replicas,
+                ..Config::default()
+            });
             let (out_tx, out) = mpsc::unbounded_channel();
-            let (tx, commands) = mpsc::unbounded_channel();
-            let mut shard = Shard::new(0, cfg, out_tx, tx, vec![SYM.to_owned()]);
-            shard.on_conn_msg(ConnMsg::Connected);
+            let (txs, commands): (Vec<_>, Vec<_>) =
+                (0..replicas).map(|_| mpsc::unbounded_channel()).unzip();
+            let mut shard = Shard::new(0, cfg, out_tx, txs, vec![SYM.to_owned()]);
+            for r in 0..replicas {
+                shard.on_replica_msg(ReplicaMsg {
+                    replica: r,
+                    kind: ReplicaMsgKind::Connected,
+                });
+            }
             Self {
                 shard,
                 out,
@@ -521,47 +757,53 @@ mod tests {
             }
         }
 
-        fn event_at(&mut self, received_at: DateTime<Utc>, event: FeedEvent) {
-            self.shard.on_conn_msg(ConnMsg::Event {
-                received_at,
-                received_mono: Instant::now(),
-                event,
+        fn event(&mut self, replica: usize, event: FeedEvent) {
+            self.shard.on_replica_msg(ReplicaMsg {
+                replica,
+                kind: ReplicaMsgKind::Event {
+                    received_at: Utc::now(),
+                    received_mono: Instant::now(),
+                    event,
+                },
             });
         }
 
-        fn event(&mut self, event: FeedEvent) {
-            self.event_at(Utc::now(), event);
+        fn snapshot(&mut self, replica: usize, bids: &[(i64, i64)], asks: &[(i64, i64)]) {
+            self.event(
+                replica,
+                FeedEvent::Snapshot {
+                    symbol: SYM.to_owned(),
+                    exchange_ts: None,
+                    bids: bids.to_vec(),
+                    asks: asks.to_vec(),
+                },
+            );
         }
 
-        fn snapshot(&mut self, bids: &[(i64, i64)], asks: &[(i64, i64)]) {
-            self.event(FeedEvent::Snapshot {
-                symbol: SYM.to_owned(),
-                exchange_ts: None,
-                bids: bids.to_vec(),
-                asks: asks.to_vec(),
-            });
-        }
-
-        fn delta(&mut self, side: Side, price: i64, delta: i64) {
-            self.event(level(side, price, delta));
+        fn delta(&mut self, replica: usize, side: Side, price: i64, delta: i64) {
+            self.event(
+                replica,
+                FeedEvent::Level {
+                    symbol: SYM.to_owned(),
+                    exchange_ts: None,
+                    side,
+                    price,
+                    change: LevelChange::Delta(delta),
+                    match_key: None,
+                },
+            );
         }
 
         fn output(&mut self) -> Vec<OutMsg> {
             std::iter::from_fn(|| self.out.try_recv().ok()).collect()
         }
 
-        fn commands(&mut self) -> Vec<ConnCommand> {
-            std::iter::from_fn(|| self.commands.try_recv().ok()).collect()
+        fn commands(&mut self, replica: usize) -> Vec<ConnCommand> {
+            std::iter::from_fn(|| self.commands[replica].try_recv().ok()).collect()
         }
-    }
 
-    fn level(side: Side, price: i64, delta: i64) -> FeedEvent {
-        FeedEvent::Level {
-            symbol: SYM.to_owned(),
-            exchange_ts: None,
-            side,
-            price,
-            change: LevelChange::Delta(delta),
+        fn primary(&self) -> Option<usize> {
+            self.shard.symbols[SYM].primary
         }
     }
 
@@ -580,120 +822,262 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_then_updates_are_written_as_absolute_quantities() {
-        let mut h = Harness::new();
-        h.snapshot(&[(400_000, 10)], &[]);
+    fn first_synced_replica_becomes_primary_and_only_it_is_written() {
+        let mut h = Harness::new(2);
+        h.snapshot(1, &[(400_000, 10)], &[]);
+        assert_eq!(h.primary(), Some(1));
         let out = h.output();
         assert_eq!(out.len(), 1);
         assert_eq!(snapshot_bids(&out[0]), vec![(400_000, 10)]);
 
-        h.delta(Side::Buy, 400_000, 5);
-        assert_eq!(update(&h.output()[0]), (Side::Buy, 400_000, 15));
+        // The standby syncs silently.
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        assert!(h.output().is_empty());
+
+        // Only the primary's updates are written, as absolute quantities.
+        h.delta(0, Side::Buy, 400_000, 5);
+        assert!(h.output().is_empty());
+        h.delta(1, Side::Buy, 400_000, 5);
+        let out = h.output();
+        assert_eq!(update(&out[0]), (Side::Buy, 400_000, 15));
     }
 
     #[test]
-    fn desync_goes_dark_until_next_snapshot() {
-        let mut h = Harness::new();
-        h.snapshot(&[(400_000, 10)], &[]);
+    fn disconnect_switches_source_with_snapshot_of_new_book() {
+        let mut h = Harness::new(2);
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        h.snapshot(1, &[(400_000, 10)], &[]);
+        // Replica 1 saw an update replica 0 missed.
+        h.delta(1, Side::Buy, 500_000, 3);
         h.output();
-        h.event(FeedEvent::Desync {
-            symbols: vec![SYM.to_owned()],
-            reason: "seq gap".to_owned(),
+
+        h.shard.on_replica_msg(ReplicaMsg {
+            replica: 0,
+            kind: ReplicaMsgKind::Disconnected,
         });
+        assert_eq!(h.primary(), Some(1));
+        let out = h.output();
+        assert_eq!(out.len(), 1);
+        // Bids are best first.
+        assert_eq!(snapshot_bids(&out[0]), vec![(500_000, 3), (400_000, 10)]);
+    }
+
+    #[test]
+    fn desync_without_alternative_goes_dark_until_next_snapshot() {
+        let mut h = Harness::new(2);
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        h.output();
+        h.event(
+            0,
+            FeedEvent::Desync {
+                symbols: vec![SYM.to_owned()],
+                reason: "seq gap".to_owned(),
+            },
+        );
+        assert_eq!(h.primary(), None);
         // Updates on a desynced book are dropped, not written.
-        h.delta(Side::Buy, 400_000, 1);
+        h.delta(0, Side::Buy, 400_000, 1);
         assert!(h.output().is_empty());
 
-        h.snapshot(&[(400_000, 7)], &[]);
+        h.snapshot(0, &[(400_000, 7)], &[]);
+        assert_eq!(h.primary(), Some(0));
         assert_eq!(snapshot_bids(&h.output()[0]), vec![(400_000, 7)]);
     }
 
     #[test]
-    fn diverged_book_is_resubscribed() {
-        let mut h = Harness::new();
-        h.snapshot(&[(400_000, 10)], &[]);
+    fn diverged_book_resubscribes_and_fails_over() {
+        let mut h = Harness::new(2);
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        h.snapshot(1, &[(400_000, 10)], &[]);
         h.output();
+
         // A delta that would take a level negative proves divergence.
-        h.delta(Side::Buy, 400_000, -11);
+        h.delta(0, Side::Buy, 400_000, -11);
         assert!(matches!(
-            h.commands().as_slice(),
+            h.commands(0).as_slice(),
             [ConnCommand::Resubscribe(s)] if s == SYM
         ));
-        assert!(h.output().is_empty());
-        h.delta(Side::Buy, 400_000, 1);
-        assert!(h.output().is_empty());
+        assert_eq!(h.primary(), Some(1));
+        let out = h.output();
+        assert_eq!(out.len(), 1);
+        assert_eq!(snapshot_bids(&out[0]), vec![(400_000, 10)]);
     }
 
     #[test]
-    fn unsynced_symbol_is_retried_with_backoff() {
-        let mut h = Harness::new();
-        h.commands();
-        h.shard.symbols.get_mut(SYM).unwrap().retry_at = Instant::now();
+    fn lagging_primary_is_resubscribed_and_replaced() {
+        let mut h = Harness::new(2);
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        h.snapshot(1, &[(400_000, 10)], &[]);
+        h.output();
+        h.commands(0);
+
+        // Replica 1 has been receiving updates; replica 0 went quiet.
+        let now = Instant::now();
+        let state = h.shard.symbols.get_mut(SYM).unwrap();
+        for rs in &mut state.replicas {
+            rs.synced_at = Some(now - Duration::from_secs(60));
+        }
+        state.unmatched.push((42, now - Duration::from_secs(11), vec![0, 1]));
+        for rs in &mut state.replicas {
+            rs.retry_at = now;
+        }
         h.shard.health_check();
-        assert_eq!(h.commands().len(), 1);
-        // The next retry is not due yet.
-        h.shard.health_check();
-        assert!(h.commands().is_empty());
-        assert!(h.shard.symbols[SYM].retry_backoff > h.shard.cfg.sync_timeout);
+
+        assert!(matches!(
+            h.commands(0).as_slice(),
+            [ConnCommand::Resubscribe(s)] if s == SYM
+        ));
+        assert!(h.commands(1).is_empty());
+        assert_eq!(h.primary(), Some(1));
+        assert_eq!(h.output().len(), 1);
     }
 
     #[test]
-    fn resubscribes_are_rate_limited() {
-        let mut h = Harness::new();
+    fn fresh_snapshot_on_one_replica_does_not_make_the_other_stale() {
+        // A quiet symbol: its last level update was long ago on both.
+        let mut h = Harness::new(2);
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        h.snapshot(1, &[(400_000, 10)], &[]);
+        let now = Instant::now();
+        let state = h.shard.symbols.get_mut(SYM).unwrap();
+        for rs in &mut state.replicas {
+            rs.synced_at = Some(now - Duration::from_secs(600));
+            rs.last_level = Some(now - Duration::from_secs(300));
+            rs.retry_at = now;
+        }
+        // Replica 1 resubscribes and gets a fresh snapshot.
+        h.snapshot(1, &[(400_000, 10)], &[]);
+        h.shard.health_check();
+        assert!(h.commands(0).is_empty());
+        assert!(h.commands(1).is_empty());
+
+        // Replica 1 gets a new update; replica 0's copy is a few ms behind.
+        // Neither is stale, even though replica 0's last update is old.
+        h.delta(1, Side::Buy, 400_000, 1);
+        h.shard.health_check();
+        h.delta(0, Side::Buy, 400_000, 1);
+        h.shard.health_check();
+        assert!(h.commands(0).is_empty());
+        assert!(h.commands(1).is_empty());
+    }
+
+    #[test]
+    fn replica_missing_an_update_is_resubscribed_but_second_arrival_is_not() {
+        let mut h = Harness::new(2);
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        h.snapshot(1, &[(400_000, 10)], &[]);
+        h.commands(0);
+        h.commands(1);
+        let keyed = |key| FeedEvent::Level {
+            symbol: SYM.to_owned(),
+            exchange_ts: None,
+            side: Side::Buy,
+            price: 400_000,
+            change: LevelChange::Delta(1),
+            match_key: Some(key),
+        };
+        // Update 1 reaches replica 0 first, then replica 1: fully matched.
+        h.event(0, keyed(1));
+        h.event(1, keyed(1));
+        // The same key twice on both replicas is matched too.
+        h.event(0, keyed(3));
+        h.event(1, keyed(3));
+        h.event(0, keyed(3));
+        h.event(1, keyed(3));
+        // Update 2 only ever reaches replica 1.
+        h.event(1, keyed(2));
+        let state = h.shard.symbols.get_mut(SYM).unwrap();
+        assert_eq!(state.unmatched.len(), 1);
+        let now = Instant::now();
+        for rs in &mut state.replicas {
+            rs.retry_at = now;
+        }
+        // Not stale yet.
+        h.shard.health_check();
+        assert!(h.commands(0).is_empty() && h.commands(1).is_empty());
+        // After stale_lag, only replica 0 (which missed update 2) is resubscribed.
+        let state = h.shard.symbols.get_mut(SYM).unwrap();
+        for rs in &mut state.replicas {
+            rs.synced_at = Some(now - Duration::from_secs(60));
+        }
+        state.unmatched[0].1 = now - Duration::from_secs(11);
+        h.shard.health_check();
+        assert!(matches!(h.commands(0).as_slice(), [ConnCommand::Resubscribe(s)] if s == SYM));
+        assert!(h.commands(1).is_empty());
+    }
+
+    #[test]
+    fn resubscribes_are_rate_limited_per_socket() {
+        let mut h = Harness::new(2);
         let symbols: Vec<String> = (0..50).map(|i| format!("S{i}")).collect();
-        h.shard.add(symbols);
-        h.commands();
+        h.shard.add(symbols.clone());
+        h.commands(0);
         let now = Instant::now();
         for state in h.shard.symbols.values_mut() {
-            state.retry_at = now;
+            state.replicas[0].retry_at = now;
         }
+        h.shard.health_check();
         let resubscribes = |cmds: Vec<ConnCommand>| {
             cmds.iter().filter(|c| matches!(c, ConnCommand::Resubscribe(_))).count()
         };
-        h.shard.health_check();
-        assert_eq!(resubscribes(h.commands()), MAX_RESUBSCRIBES_PER_TICK);
+        assert_eq!(resubscribes(h.commands(0)), MAX_RESUBSCRIBES_PER_TICK);
         // The rest go out on later ticks.
         h.shard.health_check();
-        assert_eq!(resubscribes(h.commands()), MAX_RESUBSCRIBES_PER_TICK);
+        assert_eq!(resubscribes(h.commands(0)), MAX_RESUBSCRIBES_PER_TICK);
     }
 
     #[test]
-    fn quiet_symbol_is_resubscribed_and_its_snapshot_verified() {
-        let mut h = Harness::new();
-        h.snapshot(&[(400_000, 10)], &[]);
-        h.commands();
-        let state = h.shard.symbols.get_mut(SYM).unwrap();
-        let long_ago = Instant::now() - h.shard.cfg.min_quiet * 2;
-        state.last_event = Some(long_ago);
-        state.quiet_check_at = long_ago;
-        state.retry_at = Instant::now() + Duration::from_secs(60);
+    fn unsynced_replica_is_retried_with_backoff() {
+        let mut h = Harness::new(2);
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        let now = Instant::now();
+        let rs = &mut h.shard.symbols.get_mut(SYM).unwrap().replicas[1];
+        rs.retry_at = now;
         h.shard.health_check();
-        assert!(matches!(
-            h.commands().as_slice(),
-            [ConnCommand::Resubscribe(s)] if s == SYM
-        ));
-        // The fresh snapshot differs from what we held: updates were missed.
-        h.snapshot(&[(400_000, 12)], &[]);
-        assert_eq!(h.shard.counters.recovered, 1);
+        assert_eq!(h.commands(1).len(), 1);
+        // The next retry is not due yet.
+        h.shard.health_check();
+        assert!(h.commands(1).is_empty());
+        let rs = &h.shard.symbols[SYM].replicas[1];
+        assert!(rs.retry_backoff > h.shard.cfg.sync_timeout);
     }
 
     #[test]
     fn output_timestamps_never_go_backwards() {
-        let mut h = Harness::new();
+        let mut h = Harness::new(2);
         let t0 = Utc::now();
         let at = |ms| t0 + chrono::Duration::milliseconds(ms);
-        let snapshot = FeedEvent::Snapshot {
+        let level = |price| FeedEvent::Level {
             symbol: SYM.to_owned(),
             exchange_ts: None,
-            bids: vec![(400_000, 10)],
-            asks: vec![],
+            side: Side::Buy,
+            price,
+            change: LevelChange::Delta(1),
+            match_key: None,
         };
-        h.event_at(at(1), snapshot);
-        h.event_at(at(10), level(Side::Buy, 400_000, 1));
-        // The minute snapshot is stamped with the latest receive time
-        // processed, not the wall clock.
+        h.snapshot(0, &[(400_000, 10)], &[]);
+        h.snapshot(1, &[(400_000, 10)], &[]);
+        h.output();
+        let send = |h: &mut Harness, replica, ms, event| {
+            h.shard.on_replica_msg(ReplicaMsg {
+                replica,
+                kind: ReplicaMsgKind::Event {
+                    received_at: at(ms),
+                    received_mono: Instant::now(),
+                    event,
+                },
+            });
+        };
+        // The primary's update at +10ms is written, then it fails; replica
+        // 1's queued update was received earlier (+5ms) but is processed later.
+        send(&mut h, 0, 10, level(400_000));
+        send(&mut h, 1, 5, level(400_000));
+        h.shard.on_replica_msg(ReplicaMsg {
+            replica: 0,
+            kind: ReplicaMsgKind::Disconnected,
+        });
+        send(&mut h, 1, 12, level(400_000));
         h.shard.minute_tick();
-        h.event_at(at(12), level(Side::Buy, 400_000, 1));
         let stamps: Vec<DateTime<Utc>> = h
             .output()
             .iter()
@@ -702,17 +1086,20 @@ mod tests {
                 OutMsg::Update(u) => u.backtest_timestamp,
             })
             .collect();
-        assert_eq!(stamps, vec![at(1), at(10), at(10), at(12)]);
+        assert_eq!(stamps.len(), 4);
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "{stamps:?}");
+        // The failover snapshot is not stamped later than what was received.
+        assert!(stamps[1] <= at(12));
     }
 
     #[test]
-    fn minute_tick_snapshots_every_synced_symbol() {
-        let mut h = Harness::new();
+    fn minute_tick_snapshots_every_sourced_symbol() {
+        let mut h = Harness::new(2);
         h.shard.add(vec!["B".to_owned()]);
-        h.snapshot(&[(400_000, 10)], &[]);
+        h.snapshot(0, &[(400_000, 10)], &[]);
         h.output();
         h.shard.minute_tick();
-        // "A" is synced, "B" never synced.
+        // "A" has a source, "B" never synced.
         let out = h.output();
         assert_eq!(out.len(), 1);
         assert_eq!(snapshot_bids(&out[0]), vec![(400_000, 10)]);

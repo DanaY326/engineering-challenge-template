@@ -26,10 +26,17 @@ pub enum FeedEvent {
         side: Side,
         price: i64,
         change: LevelChange,
+        /// Identifies the same exchange update across connections, so we can
+        /// measure which connection received it first (Extension 4).
+        match_key: Option<u64>,
     },
     /// This connection lost data for `symbols` (e.g. a sequence gap); their
     /// books on this connection are invalid until the next snapshot.
     Desync { symbols: Vec<String>, reason: String },
+    /// An update for `symbol` that was received but deliberately not applied
+    /// (e.g. already included in the latest snapshot). It still proves the
+    /// subscription is live, for cross-replica monitoring.
+    Seen { symbol: String, match_key: Option<u64> },
 }
 
 /// GET a JSON page, retrying rate limits (429) and server errors with
@@ -57,6 +64,12 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
         return Ok(response.error_for_status()?.json().await?);
     }
     unreachable!()
+}
+
+/// Stable within a process; only used to match updates across connections.
+pub(crate) fn hash_key(parts: impl std::hash::Hash) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(parts)
 }
 
 pub(crate) fn millis_to_utc(ms: i64) -> Option<DateTime<Utc>> {

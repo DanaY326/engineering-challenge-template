@@ -1,4 +1,4 @@
-//! One websocket connection serving a shard's symbols.
+//! One websocket connection (a "replica") serving a shard's symbols.
 //!
 //! The task owns the socket and the Kalshi session. It reconnects with
 //! backoff, sends heartbeats, tears the socket down if it goes silent, and
@@ -27,7 +27,12 @@ pub enum ConnCommand {
     Reconnect,
 }
 
-pub enum ConnMsg {
+pub struct ReplicaMsg {
+    pub replica: usize,
+    pub kind: ReplicaMsgKind,
+}
+
+pub enum ReplicaMsgKind {
     Connected,
     Disconnected,
     Event {
@@ -51,16 +56,20 @@ pub struct Connection {
     pub exchange: Arc<Kalshi>,
     pub cfg: Arc<Config>,
     pub shard: usize,
+    pub replica: usize,
     pub symbols: BTreeSet<String>,
     pub commands: UnboundedReceiver<ConnCommand>,
-    pub events: UnboundedSender<ConnMsg>,
+    pub events: UnboundedSender<ReplicaMsg>,
     pub cancel: CancellationToken,
 }
 
 impl Connection {
-    fn send(&self, msg: ConnMsg) {
+    fn send(&self, kind: ReplicaMsgKind) {
         // The shard only goes away on shutdown, at which point we stop too.
-        let _ = self.events.send(msg);
+        let _ = self.events.send(ReplicaMsg {
+            replica: self.replica,
+            kind,
+        });
     }
 
     /// Apply a command while disconnected; the next connection subscribes to
@@ -82,7 +91,7 @@ impl Connection {
         loop {
             let started = Instant::now();
             let exit = self.connect_and_stream().await;
-            self.send(ConnMsg::Disconnected);
+            self.send(ReplicaMsgKind::Disconnected);
             let reason = match exit {
                 Exit::Shutdown => return,
                 Exit::Reconnect(reason) => reason,
@@ -92,6 +101,7 @@ impl Connection {
             }
             tracing::info!(
                 shard = self.shard,
+                replica = self.replica,
                 "{} disconnected ({reason}); reconnecting in {backoff:?}",
                 self.exchange.name()
             );
@@ -129,9 +139,10 @@ impl Connection {
 
         let symbols: Vec<String> = self.symbols.iter().cloned().collect();
         session.subscribe(&symbols, &mut out);
-        self.send(ConnMsg::Connected);
+        self.send(ReplicaMsgKind::Connected);
         tracing::debug!(
             shard = self.shard,
+            replica = self.replica,
             "connected, subscribing to {} symbols",
             symbols.len()
         );
@@ -157,7 +168,7 @@ impl Connection {
                                 break Exit::Reconnect(format!("decode error: {e:#}; frame: {}", truncate(&text)));
                             }
                             for event in events.drain(..) {
-                                self.send(ConnMsg::Event { received_at, received_mono, event });
+                                self.send(ReplicaMsgKind::Event { received_at, received_mono, event });
                             }
                         }
                         Some(Ok(Message::Close(frame))) => break Exit::Reconnect(format!("server closed: {frame:?}")),
@@ -181,7 +192,7 @@ impl Connection {
                             session.resubscribe(&symbol, &mut events, &mut out);
                             let now = (Utc::now(), Instant::now());
                             for event in events.drain(..) {
-                                self.send(ConnMsg::Event { received_at: now.0, received_mono: now.1, event });
+                                self.send(ReplicaMsgKind::Event { received_at: now.0, received_mono: now.1, event });
                             }
                         }
                     }

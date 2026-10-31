@@ -9,15 +9,19 @@ use engineering_challenge::collector::{self, Config, output};
 use tokio_util::sync::CancellationToken;
 
 /// Collect orderbooks for every live Kalshi market, writing SBE snapshots
-/// (on sync and every minute) and price level updates.
+/// (every minute and on source changes) and price level updates.
 #[derive(Parser, Debug)]
 struct Cli {
     /// Output file; "-" writes to stdout. Logs always go to stderr.
     #[arg(long, short, default_value = "-")]
     output: String,
 
-    /// Markets per shard (one socket each). Kalshi has ~170k mostly-illiquid
-    /// markets.
+    /// Redundant websockets per shard.
+    #[arg(long, default_value_t = 2)]
+    replicas: usize,
+
+    /// Markets per shard (each shard has `--replicas` sockets). Kalshi has
+    /// ~170k mostly-illiquid markets.
     #[arg(long, default_value_t = 1000)]
     symbols_per_shard: usize,
 
@@ -66,9 +70,11 @@ fn main() -> anyhow::Result<()> {
         Err(e) => anyhow::bail!("reading .env: {e}"),
     }
     let cli = Cli::parse();
+    anyhow::ensure!((1..=32).contains(&cli.replicas), "--replicas must be 1..=32");
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cfg = Config {
+        replicas: cli.replicas,
         symbols_per_shard: cli.symbols_per_shard,
         max_symbols: cli.max_symbols,
         discovery_interval: Duration::from_secs(cli.discovery_interval_secs),
